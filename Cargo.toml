@@ -1,0 +1,9 @@
+[package]
+name = "vantage-5G"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+libbpf-sys = "1.4" # without bpftool using vantage CLI
+anyhow = "1.0"
