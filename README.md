@@ -487,3 +487,180 @@ sudo ping -f -s 1400 -c 1000 10.45.1.100
 ```
 
 성공 데이터 지표: `1000 received, 0% packet loss, time 4515ms` (물리적 대역폭 억제 완료 및 록리스 평탄화 증명)
+
+## Phase 4: 동적 대역폭 자율 제어(Dynamic QoS Control) 플레이북
+
+### 아키텍처 목표 및 달성 성과
+목표: 5G 단말의 트래픽을 제어하는 eBPF 데이터 평면을 재컴파일이나 무중단(Zero-Downtime) 상태로 유지하면서, 외부의 관리 명령에 따라 특정 테넌트의 대역폭을 실시간으로 조절하거나 차단하는 것.
+
+성과: 커널 공간에 '동적 대역폭 설정 맵(`tenant_bw_map`)'을 신설하고, bpftool 같은 외부 유틸리티 없이 리눅스 커널 시스템 콜(`libbpf-sys`)을 직접 타격하는 Rust 기반의 전용 제어기(`vantage-cli`)를 완벽하게 구축함.
+
+### Breakthroughs
+- __킬 스위치 (Kill Switch):__ 맵에서 읽어온 대상 대역폭 값이 `0`일 경우, 커널 스케줄러로 패킷을 넘기지 않고 최하단에서 즉시 폐기(`TC_ACT_SHOT`)하는 강력한 하드웨어 격리 로직을 구현했습니다.
+- __동적 지연 시간(Delay) 연산 엔진:__ 상수였던 지연 시간을 런타임 변수($R_{dynamic}$)를 받아서 처리하는 동적 방정식으로 진화시켰습니다.
+$$\Delta t = \frac{L \times 8 \times 10^9\text{ ns}}{R_{dynamic}}$$
+- __Zero-Overhead 메모리 제어 (Rust Native Syscall):__ 추상화된 고수준 라이브러리(`libbpf-rs`)의 한계를 버리고, `libbpf-sys`를 도입하여 커널에 핀(Pin)된 맵의 파일 디스크립터(fd)를 직접 획득, C 언어 수준의 속도로 메모리를 조작하는 완벽한 CLI를 구현했습니다.
+
+### 최종 무결성 산출물 (Golden Code Reference)
+1) 데이터 평면: `vantage_dynamic_edt.c` (eBPF C)
+특정 테넌트 번호(5001) 하드코딩을 제거하고, 범용적인 동적 제어를 수행하는 최종 엔진입니다.
+
+```c
+// (헤더 및 기존 cilium_ipcache_v2, tenant_tstamp_map 선언부 생략...)
+
+// [Phase 4: 동적 대역폭 설정 맵]
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, __u32);   // Identity (Tenant ID)
+    __type(value, __u64); // Target Bandwidth in bps
+    __uint(max_entries, 1024);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+} tenant_bw_map SEC(".maps");
+
+SEC("tc_egress")
+int vantage_dynamic_pacing(struct __sk_buff *skb) {
+    // (이더넷/IP 헤더 검증 생략...)
+
+    struct cilium_ipcache_key key = {};
+    key.prefixlen = 64;
+    key.pad_family[3] = 1;
+    __builtin_memcpy(&key.ip_address, &ip->daddr, sizeof(ip->daddr));
+
+    struct cilium_ipcache_value *val = bpf_map_lookup_elem(&cilium_ipcache_v2, &key);
+    
+    // 식별된 모든 K8s 테넌트에 대해 통제 로직 수행
+    if (val) {
+        __u32 tenant_id = val->identity;
+        
+        // 해당 테넌트가 대역폭 통제 맵에 존재하는지 확인
+        __u64 *bw_ptr = bpf_map_lookup_elem(&tenant_bw_map, &tenant_id);
+        if (bw_ptr) {
+            if (*bw_ptr == 0) return TC_ACT_SHOT; // 🛑 0Mbps 킬 스위치 (즉각 폐기)
+
+            __u64 target_bps = *bw_ptr;
+            __u64 delay_ns = ((__u64)skb->len * 8000000000ULL) / target_bps; // 🚀 동적 딜레이 계산
+
+            __u64 now = bpf_ktime_get_ns();
+            __u64 next_tstamp = now;
+            __u64 *last_tstamp = bpf_map_lookup_elem(&tenant_tstamp_map, &tenant_id);
+
+            if (last_tstamp) {
+                if (*last_tstamp > now) next_tstamp = *last_tstamp;
+            } else {
+                bpf_map_update_elem(&tenant_tstamp_map, &tenant_id, &now, BPF_ANY);
+                last_tstamp = bpf_map_lookup_elem(&tenant_tstamp_map, &tenant_id);
+                if (!last_tstamp) return TC_ACT_OK;
+            }
+
+            next_tstamp += delay_ns;
+            *last_tstamp = next_tstamp;
+            skb->tstamp = next_tstamp; // FQ 스케줄러를 위한 타임스탬프 각인
+        }
+    }
+    return TC_ACT_OK;
+}
+char _license[] SEC("license") = "GPL";
+```
+
+2) 제어 평면: `src/main.rs` (Rust CLI)
+관리자가 직관적으로 시스템을 통제할 수 있도록 `libbpf-sys`를 래핑한 CLI 도구입니다.
+
+```rust
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand};
+use std::ffi::CString;
+
+#[derive(Parser)]
+#[command(name = "vantage-cli", about = "Controls 5G Tenant Bandwidth via Pinned eBPF Maps")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    Set { #[arg(short, long)] tenant: u32, #[arg(short, long)] bw_mbps: u64 },
+    Reset { #[arg(short, long)] tenant: u32 },
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let map_path = CString::new("/sys/fs/bpf/tc/globals/tenant_bw_map")?;
+    let fd = unsafe { libbpf_sys::bpf_obj_get(map_path.as_ptr()) };
+    
+    if fd < 0 { bail!("Failed to open pinned map."); }
+
+    match &cli.command {
+        Commands::Set { tenant, bw_mbps } => {
+            let target_bps: u64 = bw_mbps * 1_000_000;
+            let key = tenant.to_ne_bytes();
+            let value = target_bps.to_ne_bytes();
+
+            let ret = unsafe {
+                libbpf_sys::bpf_map_update_elem(fd, key.as_ptr() as *const _, value.as_ptr() as *const _, libbpf_sys::BPF_ANY.into())
+            };
+            if ret != 0 { bail!("Update failed."); }
+            println!("[Vantage-5G] Tenant {} bandwidth set to {} Mbps.", tenant, bw_mbps);
+        }
+        Commands::Reset { tenant } => {
+            let key = tenant.to_ne_bytes();
+            unsafe { libbpf_sys::bpf_map_delete_elem(fd, key.as_ptr() as *const _) };
+            println!("[Vantage-5G] Tenant {} policy removed.", tenant);
+        }
+    }
+    Ok(())
+}
+```
+```bash
+#파이프라인 재가동
+cargo build --release
+
+#글로벌 환경에서 편하게 쓰기 위해 /usr/local/bin으로 복사
+sudo cp target/release/vantage-5G /usr/local/bin/vantage-cli
+```
+
+### 테스트
+이제 bpftool이 아닌 Vantage CLI로 커널을 통제합니다.
+
+- [터미널1]
+```bash
+# 1. 대역폭 10Mbps로 조이기 (지연 시간 1.15ms 확인)
+sudo vantage-cli set --tenant 5001 --bw-mbps 10
+
+# 2. 대역폭 100Mbps로 전격 개방 (지연 시간 0.11ms로 급감 확인)
+sudo vantage-cli set --tenant 5001 --bw-mbps 100
+
+# 3. 이상 감지: 킬 스위치 발동 (trace 로그 멈춤 및 ping 100% loss 체감)
+sudo vantage-cli set --tenant 5001 --bw-mbps 0
+
+# 4. 차단 해제 (원상 복구)
+sudo vantage-cli reset --tenant 5001
+```
+- [터미널2]
+```bash
+sudo cat /sys/kernel/debug/tracing/trace_pipe
+```
+- [터미널3]
+```bash
+ping -i 0.1 -s 1400 10.45.1.100
+```
+
+
+### 실전 운영 파이프라인 (Ops Pipeline)
+향후 노드 재부팅이나 새로운 인프라 전개 시, 다음 명령어를 통해 데이터 평면을 부착하고 CLI로 통제합니다.
+
+```bash
+# 1. 인프라 준비 및 데이터 평면 컴파일/부착
+sudo tc qdisc replace dev lo root fq
+sudo clang -O2 -g -target bpf -c vantage_dynamic_edt.c -o vantage_dynamic_edt.o
+sudo tc filter replace dev lo egress bpf da obj vantage_dynamic_edt.o sec tc_egress
+
+# 2. Rust CLI 빌드 및 글로벌 배포
+cargo build --release
+sudo cp target/release/vantage-5G /usr/local/bin/vantage-cli
+
+# 3. 실시간 트래픽 제어 (Run-time Commands)
+sudo vantage-cli set --tenant 5001 --bw-mbps 100  # 100Mbps 할당
+sudo vantage-cli set --tenant 5001 --bw-mbps 0    # 격리(Kill Switch)
+sudo vantage-cli reset --tenant 5001              # 정책 해제
+```
