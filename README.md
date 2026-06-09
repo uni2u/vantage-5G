@@ -5,7 +5,7 @@
 ### Rust 컴파일러 및 빌드 툴체인 설치
 순정 Ubuntu 24.04 환경에 시스템 프로그래밍을 위한 Rust 환경을 구축합니다.
 
-```
+```bash
 # 1. Rust 공식 인스톨러 다운로드 및 설치 (설치 프롬프트에서 '1' 입력 후 Enter)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
@@ -19,7 +19,7 @@ cargo --version
 ### 프로젝트 디렉터리 생성 및 초기화
 Vantage-5G 제어 평면 에이전트를 개발할 작업 공간을 구성합니다.
 
-```
+```bash
 # 1. 프로젝트 최상위 디렉터리 생성 및 이동
 mkdir -p ~/vantage-5G
 cd ~/vantage-5G
@@ -33,7 +33,7 @@ cargo init --bin
 
 `~/vantage-5G/Cargo.toml` 파일을 열어 아래 내용으로 완전히 덮어씁니다.
 
-```
+```toml
 [package]
 name = "vantage-5G"
 version = "0.1.0"
@@ -49,7 +49,7 @@ Cilium v2 맵의 24B/24B 패딩 규격을 완벽하게 리버스 엔지니어링
 
 `~/vantage-5G/src/main.rs` 파일을 열어 아래 내용으로 완전히 덮어씁니다.
 
-```
+```rust
 // src/main.rs - Vantage-5G 제어 평면 eBPF 커널 직결 에이전트
 use std::ffi::CString;
 use std::path::Path;
@@ -185,7 +185,7 @@ fn main() -> Result<(), std::io::Error> {
 ### 빌드 및 실전 집행 (커널 타격)
 일반 권한으로 최적화 컴파일을 수행한 뒤, 생성된 바이너리만 최고 관리자 권한으로 기동합니다.
 
-```
+```bash
 # 1. 프로젝트 디렉터리 내에서 릴리즈 최적화 빌드 수행
 cd ~/vantage-5G
 cargo build --release
@@ -197,7 +197,7 @@ sudo ./target/release/vantage-5G
 ### 실증 및 교차 검증 (Cilium CLI)
 데이터가 커널에 안착한 직후, K8s 클러스터 내부의 Cilium 데몬이 해당 데이터를 유효한 가입자로 인식했는지 최종 확인합니다.
 
-```
+```bash
 # 1. Cilium 데몬 Pod 이름 추출
 CILIUM_POD=$(sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system -l k8s-app=cilium -o jsonpath='{.items[0].metadata.name}')
 
@@ -226,7 +226,7 @@ sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf exec -n kube-system $CILIUM
 이 코드는 어떠한 노이즈도 없이, 오직 우리가 지정한 `5001`번 테넌트의 패킷만 커널 로그에 출력하는 완벽한 스나이퍼 모드(Sniper Mode) 데이터 평면 코드입니다.
 
 `vantage_datapath.c`
-``` vantage_datapath.c
+```c
 #include <linux/bpf.h>
 #include <linux/pkt_cls.h>
 #include <linux/if_ether.h>
@@ -303,7 +303,7 @@ char _license[] SEC("license") = "GPL";
 향후 시스템을 재부팅하거나 완전히 새로운 환경에서 이 코드를 실증할 때 사용하는 표준 명령 셋입니다.
 
 #### Step 1: 환경 정렬 및 eBPF 컴파일/부착
-``` bash
+```bash
 # 1. 대상 IP를 루프백 인터페이스에 로컬 바인딩 (Martian Drop 우회)
 sudo ip addr add 10.45.1.100/32 dev lo
 
@@ -344,7 +344,7 @@ $$\Delta t = L \times 8 \times \frac{10^9\text{ ns}}{10,000,000\text{ bps}} = L 
 ### 최종 무결성 산출물 (Golden Code Reference)
 `vantage_edt.c`
 
-``` c
+```c
 // vantage_edt.c - Vantage-5G eBPF-EDT Pacing Core
 #include <linux/bpf.h>
 #include <linux/pkt_cls.h>
@@ -455,7 +455,7 @@ char _license[] SEC("license") = "GPL";
 
 #### Step 1: 커널 FQ 및 전용 clsact 큐디스크 적재
 
-``` bash
+```bash
 # 1. 소스코드 컴파일
 sudo clang -O2 -g -target bpf -c vantage_edt.c -o vantage_edt.o
 
