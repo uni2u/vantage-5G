@@ -225,7 +225,7 @@ sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf exec -n kube-system $CILIUM
 ### 최종 무결성 산출물 (Golden Code Reference)
 이 코드는 어떠한 노이즈도 없이, 오직 우리가 지정한 `5001`번 테넌트의 패킷만 커널 로그에 출력하는 완벽한 스나이퍼 모드(Sniper Mode) 데이터 평면 코드입니다.
 
-vantage_datapath.c
+`vantage_datapath.c`
 ``` vantage_datapath.c
 #include <linux/bpf.h>
 #include <linux/pkt_cls.h>
