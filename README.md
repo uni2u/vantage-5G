@@ -207,3 +207,121 @@ sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf exec -n kube-system $CILIUM
 
 성공 출력 예시: `10.45.1.100/32    identity=5001 encryptkey=0 tunnelendpoint=0.0.0.0 flags=<none>`
 
+## Phase 2: eBPF 데이터 평면 패킷 식별 실증 플레이북
+
+### 아키텍처 목표 및 달성 성과
+목표: Phase 1에서 제어 평면을 통해 커널 맵에 주입한 가입자 정보(`10.45.1.100` -> `5001`)를, 실제 데이터 평면(Data Plane)에서 흐르는 패킷을 가로채어 커널 레벨에서 즉각 식별하고 판독하는 것.
+
+성과: 커널의 맵 검증 규격, ARP 드롭, 로컬 라우팅(Martian Packet) 차단, 그리고 Cilium GC의 간섭을 모두 뚫어내고, `lo` 인터페이스의 Egress 훅에서 대상 패킷을 100%의 정확도로 저격(Sniping)하는 eBPF C 코드를 완성함.
+
+### Breakthroughs
+이 플레이북에서 가장 가치 있는 정보는 우리가 마주했던 커널 스택의 4대 함정과 그 타파 방법입니다.
+
+- __Parameter Mismatch (맵 규격 충돌):__ Cilium은 데이터 평면의 무결성을 위해 맵에 flags: 129 (`BPF_F_NO_PREALLOC` | `BPF_F_RDONLY_PROG`)라는 숨겨진 읽기 전용(Read-Only) 락을 걸어둡니다. 이를 C 코드에 정확히 100% 동기화하여 해결했습니다.
+- __네트워크 방향성과 IP 추출 (`saddr` vs `daddr`):__ 호스트 로컬에서 핑을 쏠 때는 패킷의 출발지가 아닌 목적지(`daddr`)를 뜯어봐야 맵에 기록된 타겟 IP(`10.45.1.100`)와 일치한다는 점을 교정했습니다.
+- __가상 인터페이스 조기 폐기 (Dummy Drop) & Martian 라우팅:__ 더미 인터페이스의 태생적 패킷 증발 현상을 막기 위해 사냥터를 루프백(`lo`)으로 옮기고, `10.45.1.100/32` 주소를 `lo` 인터페이스에 로컬 바인딩하여 커널의 라우팅 차단을 완벽히 우회했습니다.
+- __Cilium GC 간섭 방어 (Rapid Fire):__ 제어 평면 데이터가 Cilium의 가비지 컬렉터에 의해 삭제되기 전에 실증을 끝내기 위해, 데이터를 꽂자마자 패킷을 사격하는 '동시 타격 전술'을 수립했습니다.
+
+### 최종 무결성 산출물 (Golden Code Reference)
+이 코드는 어떠한 노이즈도 없이, 오직 우리가 지정한 `5001`번 테넌트의 패킷만 커널 로그에 출력하는 완벽한 스나이퍼 모드(Sniper Mode) 데이터 평면 코드입니다.
+
+``` vantage_datapath.c
+#include <linux/bpf.h>
+#include <linux/pkt_cls.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
+
+// [핵심] Cilium 맵 규격 완벽 동기화 (Flags 129)
+#ifndef BPF_F_NO_PREALLOC
+#define BPF_F_NO_PREALLOC 1
+#endif
+#ifndef BPF_F_RDONLY_PROG
+#define BPF_F_RDONLY_PROG 128
+#endif
+#ifndef LIBBPF_PIN_BY_NAME
+#define LIBBPF_PIN_BY_NAME 1
+#endif
+
+struct cilium_ipcache_key {
+    __u32 prefixlen;
+    __u8  pad_family[4];
+    __u8  ip_address[16];
+} __attribute__((packed));
+
+struct cilium_ipcache_value {
+    __u32 identity;
+    __u32 tunnel_endpoint;
+    __u8  key_flags_cluster[4];
+    __u32 pad1;
+    __u64 pad2;
+} __attribute__((packed));
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(key_size, sizeof(struct cilium_ipcache_key));
+    __uint(value_size, sizeof(struct cilium_ipcache_value));
+    __uint(max_entries, 512000);
+    __uint(map_flags, BPF_F_NO_PREALLOC | BPF_F_RDONLY_PROG); // Flags 129
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+} cilium_ipcache_v2 SEC(".maps");
+
+SEC("tc_ingress")
+int vantage_tc_filter(struct __sk_buff *skb) {
+    void *data_end = (void *)(long)skb->data_end;
+    void *data     = (void *)(long)skb->data;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end) return TC_ACT_OK;
+    if (eth->h_proto != bpf_htons(ETH_P_IP)) return TC_ACT_OK;
+
+    struct iphdr *ip = (void *)(eth + 1);
+    if ((void *)(ip + 1) > data_end) return TC_ACT_OK;
+
+    // 맵 룩업 준비 (목적지 IP 기준)
+    struct cilium_ipcache_key key = {};
+    key.prefixlen = 64;
+    key.pad_family[3] = 1;
+    __builtin_memcpy(&key.ip_address, &ip->daddr, sizeof(ip->daddr));
+
+    struct cilium_ipcache_value *val = bpf_map_lookup_elem(&cilium_ipcache_v2, &key);
+    
+    // [스나이퍼 샷] 5001번 테넌트 식별 시 즉각 로깅
+    if (val && val->identity == 5001) {
+        bpf_printk("[Vantage-5G] CRITICAL HIT! Tenant 5001 Packet Detected! IP: %pI4\n", &ip->daddr);
+    }
+
+    return TC_ACT_OK;
+}
+
+char _license[] SEC("license") = "GPL";
+```
+
+### 실전 가동 및 검증 파이프라인 (Rapid Fire Sequence)
+향후 시스템을 재부팅하거나 완전히 새로운 환경에서 이 코드를 실증할 때 사용하는 표준 명령 셋입니다.
+
+#### Step 1: 환경 정렬 및 eBPF 컴파일/부착
+``` bash
+# 1. 대상 IP를 루프백 인터페이스에 로컬 바인딩 (Martian Drop 우회)
+sudo ip addr add 10.45.1.100/32 dev lo
+
+# 2. C 코드 컴파일 및 루프백 인터페이스 부착
+sudo clang -O2 -g -target bpf -c vantage_datapath.c -o vantage_datapath.o
+sudo tc qdisc del dev lo clsact 2>/dev/null
+sudo tc qdisc add dev lo clsact
+sudo tc filter add dev lo egress bpf da obj vantage_datapath.o sec tc_ingress
+
+# 3. 커널 로깅 활성화
+echo 1 | sudo tee /sys/kernel/debug/tracing/tracing_on
+```
+
+#### Step 2: 실증 작전 집행 (3-Terminal 동시 진행)
+Cilium GC가 데이터를 지우기 전에 꽂고 쏘는 쾌속 콤보입니다.
+
+- [창1: 모니터링] `sudo cat /sys/kernel/debug/tracing/trace_pipe`
+- [창 2: 제어 평면 맵 주입] `sudo ./target/release/vantage-5g`
+- [창 3: 데이터 평면 패킷 사격] `ping -c 3 10.45.1.100` (창 2 실행 직후 즉시 엔터)
+
+성공 출력 예시: `bpf_trace_printk: [Vantage-5G] CRITICAL HIT! Tenant 5001 Packet Detected! IP: 10.45.1.100`
+
