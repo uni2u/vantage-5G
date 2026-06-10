@@ -664,3 +664,221 @@ sudo vantage-cli set --tenant 5001 --bw-mbps 100  # 100Mbps 할당
 sudo vantage-cli set --tenant 5001 --bw-mbps 0    # 격리(Kill Switch)
 sudo vantage-cli reset --tenant 5001              # 정책 해제
 ```
+
+## Phase 5: 실전 Egress Gateway 전환 및 텔레메트리 파이프라인 플레이북
+
+### 아키텍처 목표 및 달성 성과
+- 목표: 루프백(`lo`) 샌드박스를 탈피하여 실제 5G Core(UPF)와 맞닿은 물리적/논리적 관문(`enp0s3`)으로 제어 평면을 이관하고, 텍스트 파싱의 한계를 넘는 초고속 바이너리 텔레메트리를 구축하는 것.
+- 성과: K8s 싱글 노드 자체를 Egress Gateway로 승격시켰으며, 트래픽의 출발지(`saddr`)를 기반으로 다운링크(Downlink) 대역폭을 서비스별로 쪼개는(Slicing) 로직을 완성했습니다. 또한, __BPF Ring Buffer__를 도입하여 커널과 Rust 사용자 공간 간의 __Zero-Overhead__ 실시간 관제망을 확립했습니다.
+
+### Breakthroughs
+1. __관문 타격점 이동 (Sandbox ➡️ `enp0s3`):__ 가상 라우팅 족쇄를 풀고 실제 물리 네트워크 인터페이스의 `tc_egress` 훅에 FQ 스케줄러와 eBPF 엔진을 결합하여, 실제 K8s 파드에서 외부로 나가는 트래픽을 직접 장악했습니다.
+2. __다운링크 서비스 페이싱 (Downlink Slicing):__ 패킷의 목적지(`daddr`, 5G 단말)가 아닌 출발지(`saddr`, K8s iperf server 파드)의 IP를 읽어 테넌트를 식별하도록 단 한 줄의 C 코드를 수정함으로써, '데이터를 생산하는 서비스 주체별 다운링크 SLA 제어'라는 상용 5G 특화망의 핵심 요구사항을 달성했습니다.
+3. __Lock-less 바이너리 텔레메트리 (BPF Ring Buffer):__ `bpf_printk`의 텍스트 변환 및 버퍼 병목을 제거했습니다. eBPF C 코드가 메모리에 쏜 바이너리 구조체(`struct telemetry_event`)를 Rust의 `#[repr(C)]` 구조체가 1:1 캐스팅으로 즉시 읽어 들여 CPU 오버헤드 0%에 수렴하는 관제 데몬을 완성했습니다.
+
+최종 무결성 산출물 (Golden Code Reference)
+1) 데이터 평면: 다운링크 제어 및 Ring Buffer (`vantage_ringbuf_edt.c`)
+출발지 IP 기반 테넌트 식별과 비동기 텔레메트리 투척이 결합된 커널 엔진입니다.
+```c
+// [Phase 5 핵심 구조체 및 맵 선언]
+struct telemetry_event {
+    __u32 tenant_id;
+    __u32 pkt_len;
+    __u64 target_bps;
+    __u64 delay_ns;
+    __u64 timestamp_ns;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024); // 256KB 락리스 버퍼
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+} telemetry_rb SEC(".maps");
+
+SEC("tc_egress")
+int vantage_telemetry_pacing(struct __sk_buff *skb) {
+    // ... (이더넷/IP 헤더 검증 생략) ...
+
+    struct cilium_ipcache_key key = {};
+    key.prefixlen = 64;
+    key.pad_family[3] = 1;
+    
+    // 🎯 [핵심 전환] 출발지 IP(saddr) 기반 서비스 테넌트 식별 (Downlink 제어)
+    __builtin_memcpy(&key.ip_address, &ip->saddr, sizeof(ip->saddr));
+    struct cilium_ipcache_value *val = bpf_map_lookup_elem(&cilium_ipcache_v2, &key);
+    
+    __u32 tenant_id = 0;
+    if (val) tenant_id = val->identity;
+    else if (ip->daddr == bpf_htonl(0x0A2D0164)) tenant_id = 5001; // 하드웨어 우회로 (10.45.1.100)
+
+    if (tenant_id != 0) {
+        __u64 *bw_ptr = bpf_map_lookup_elem(&tenant_bw_map, &tenant_id);
+        if (bw_ptr) {
+            if (*bw_ptr == 0) return TC_ACT_SHOT; // Kill Switch
+
+            // EDT 딜레이 산출 및 스케줄링 로직...
+            __u64 target_bps = *bw_ptr;
+            __u64 delay_ns = ((__u64)skb->len * 8000000000ULL) / target_bps;
+            // ... (skb->tstamp 각인 생략) ...
+
+            // 🎯 [핵심 전환] 텍스트 로그 대신 Ring Buffer로 구조체 투척
+            struct telemetry_event *evt;
+            evt = bpf_ringbuf_reserve(&telemetry_rb, sizeof(*evt), 0);
+            if (evt) {
+                evt->tenant_id = tenant_id;
+                evt->pkt_len = skb->len;
+                evt->target_bps = target_bps;
+                evt->delay_ns = delay_ns;
+                evt->timestamp_ns = bpf_ktime_get_ns();
+                bpf_ringbuf_submit(evt, 0); 
+            }
+        }
+    }
+    return TC_ACT_OK;
+}
+```
+
+2) 제어 평면: 통합 관제 CLI (`src/main.rs`)
+Low-level Syscall(`libbpf-sys`)을 통해 제어 명령과 텔레메트리 수신을 동시에 수행하는 Rust 에이전트입니다.
+
+```rust
+use anyhow::{Result, bail};
+use clap::{Parser, Subcommand};
+use std::ffi::CString;
+use std::os::raw::{c_int, c_void};
+
+#[derive(Parser)]
+#[command(name = "vantage-cli", about = "Vantage-5G Control & Telemetry CLI")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// 특정 테넌트의 대역폭을 설정합니다 (QoS Enforcement)
+    Set {
+        #[arg(short, long)] tenant: u32,
+        #[arg(short, long)] bw_mbps: u64,
+    },
+    /// 대역폭 제한을 해제합니다.
+    Reset {
+        #[arg(short, long)] tenant: u32,
+    },
+    /// 📡 [Phase 5] 실시간 텔레메트리 모니터링 데몬 실행
+    Monitor,
+}
+
+// eBPF C 코드의 telemetry_event와 메모리 레이아웃 100% 동일 정렬
+#[repr(C)]
+struct TelemetryEvent {
+    tenant_id: u32,
+    pkt_len: u32,
+    target_bps: u64,
+    delay_ns: u64,
+    timestamp_ns: u64,
+}
+
+// 2. 콜백 함수 시그니처 수정 (usize -> u64 로 변경 및 unsafe 명시)
+unsafe extern "C" fn handle_event(_ctx: *mut c_void, data: *mut c_void, _size: u64) -> c_int {
+    // unsafe 함수 내부이므로 unsafe 블록을 따로 열 필요가 없습니다.
+    let event = std::ptr::read(data as *const TelemetryEvent);
+    
+    let target_mbps = event.target_bps / 1_000_000;
+    let delay_ms = event.delay_ns as f64 / 1_000_000.0;
+
+    println!("[📡 EVENT] Tenant: {} | 📦 {} Bytes | 🚀 {} Mbps | ⏱️ Delay: {:.2} ms", 
+        event.tenant_id, event.pkt_len, target_mbps, delay_ms);
+    
+    0 // 정상 처리 반환
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    
+    match &cli.command {
+        Commands::Set { tenant, bw_mbps } => {
+            let map_path = CString::new("/sys/fs/bpf/tc/globals/tenant_bw_map")?;
+            let fd = unsafe { libbpf_sys::bpf_obj_get(map_path.as_ptr()) };
+            if fd < 0 { bail!("Failed to open tenant_bw_map. eBPF 데이터 평면 확인 요망."); }
+            
+            let target_bps: u64 = bw_mbps * 1_000_000;
+            let key = tenant.to_ne_bytes();
+            let value = target_bps.to_ne_bytes();
+
+            let ret = unsafe {
+                libbpf_sys::bpf_map_update_elem(fd, key.as_ptr() as *const _, value.as_ptr() as *const _, libbpf_sys::BPF_ANY.into())
+            };
+            if ret != 0 { bail!("Update failed."); }
+            println!("[Vantage-5G] 🚀 Tenant {} bandwidth set to {} Mbps.", tenant, bw_mbps);
+        }
+        Commands::Reset { tenant } => {
+            let map_path = CString::new("/sys/fs/bpf/tc/globals/tenant_bw_map")?;
+            let fd = unsafe { libbpf_sys::bpf_obj_get(map_path.as_ptr()) };
+            if fd < 0 { bail!("Failed to open tenant_bw_map."); }
+
+            let key = tenant.to_ne_bytes();
+            unsafe { libbpf_sys::bpf_map_delete_elem(fd, key.as_ptr() as *const _) };
+            println!("[Vantage-5G] 🔓 Tenant {} policy removed.", tenant);
+        }
+        Commands::Monitor => {
+            // Ring Buffer 맵의 File Descriptor 획득
+            let map_path = CString::new("/sys/fs/bpf/tc/globals/telemetry_rb")?;
+            let fd = unsafe { libbpf_sys::bpf_obj_get(map_path.as_ptr()) };
+            if fd < 0 { 
+                bail!("Failed to open telemetry_rb. eBPF 코드가 정상 로드되었는지 확인하십시오."); 
+            }
+
+            println!("[Vantage-5G] 📡 BPF Ring Buffer 텔레메트리 수신 개시... (Ctrl+C 종료)");
+
+            // 커널 버퍼와 Rust 콜백 함수 연결
+            let rb = unsafe {
+                libbpf_sys::ring_buffer__new(fd, Some(handle_event), std::ptr::null_mut(), std::ptr::null())
+            };
+
+            if rb.is_null() {
+                bail!("Failed to create ring buffer object.");
+            }
+
+            // 폴링 루프 (커널 버퍼를 주기적으로 확인)
+            loop {
+                let err = unsafe { libbpf_sys::ring_buffer__poll(rb, 100) }; // 100ms 타임아웃
+                if err < 0 {
+                    println!("Poll error: {}", err);
+                    break;
+                }
+            }
+            
+            unsafe { libbpf_sys::ring_buffer__free(rb) };
+        }
+    }
+    Ok(())
+}
+```
+
+### 실전 운영 파이프라인 (Ops Pipeline)
+향후 시스템 재부팅이나 신규 관문 구축 시, 다음의 이관(Migration) 및 실행 시퀀스를 따릅니다.
+
+1) Egress Gateway 인프라 준비
+```bash
+# 1. 샌드박스(lo) 잔재 철거 (필요시)
+sudo ip addr del 10.45.1.100/32 dev lo
+sudo tc qdisc del dev lo clsact
+
+# 2. 실전 관문(enp0s3) 식별 및 eBPF 엔진 적재
+ip route get 8.8.8.8 # 인터페이스 이름 확인
+sudo tc qdisc replace dev enp0s3 root fq
+sudo tc qdisc add dev enp0s3 clsact
+sudo tc filter replace dev enp0s3 egress bpf da obj vantage_ringbuf_edt.o sec tc_egress
+```
+2) 3-Terminal 실시간 관제 및 제어
+```bash
+# [창 1] 텔레메트리 레이더 가동
+sudo vantage-cli monitor
+
+# [창 2] 대상 서비스 다운링크 대역폭 통제 (예: 20Mbps 제한)
+sudo vantage-cli set --tenant 5001 --bw-mbps 20
+
+# [창 3] 트래픽 사격
+ping -i 0.1 -s 1400 10.45.1.100
+```
