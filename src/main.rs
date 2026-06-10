@@ -1,11 +1,10 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use std::ffi::CString;
+use std::os::raw::{c_int, c_void};
 
-/// Vantage-5G: eBPF-EDT 기반 동적 대역폭 제어 CLI
 #[derive(Parser)]
-#[command(name = "vantage-cli")]
-#[command(about = "Controls 5G Tenant Bandwidth via Pinned eBPF Maps", long_about = None)]
+#[command(name = "vantage-cli", about = "Vantage-5G Control & Telemetry CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -15,79 +14,99 @@ struct Cli {
 enum Commands {
     /// 특정 테넌트의 대역폭을 설정합니다 (QoS Enforcement)
     Set {
-        /// Cilium이 부여한 테넌트 Identity 번호 (예: 5001)
-        #[arg(short, long)]
-        tenant: u32,
-
-        /// 목표 대역폭 (단위: Mbps). 0 입력 시 즉각 차단(Kill Switch).
-        #[arg(short, long)]
-        bw_mbps: u64,
+        #[arg(short, long)] tenant: u32,
+        #[arg(short, long)] bw_mbps: u64,
     },
-    /// 특정 테넌트의 정책을 삭제하여 대역폭 제한을 해제합니다.
+    /// 대역폭 제한을 해제합니다.
     Reset {
-        #[arg(short, long)]
-        tenant: u32,
+        #[arg(short, long)] tenant: u32,
     },
+    /// 📡 [Phase 5] 실시간 텔레메트리 모니터링 데몬 실행
+    Monitor,
+}
+
+// eBPF C 코드의 telemetry_event와 메모리 레이아웃 100% 동일 정렬
+#[repr(C)]
+struct TelemetryEvent {
+    tenant_id: u32,
+    pkt_len: u32,
+    target_bps: u64,
+    delay_ns: u64,
+    timestamp_ns: u64,
+}
+
+// 2. 콜백 함수 시그니처 수정 (usize -> u64 로 변경 및 unsafe 명시)
+unsafe extern "C" fn handle_event(_ctx: *mut c_void, data: *mut c_void, _size: u64) -> c_int {
+    // unsafe 함수 내부이므로 unsafe 블록을 따로 열 필요가 없습니다.
+    let event = std::ptr::read(data as *const TelemetryEvent);
+    
+    let target_mbps = event.target_bps / 1_000_000;
+    let delay_ms = event.delay_ns as f64 / 1_000_000.0;
+
+    println!("[📡 EVENT] Tenant: {} | 📦 {} Bytes | 🚀 {} Mbps | ⏱️ Delay: {:.2} ms", 
+        event.tenant_id, event.pkt_len, target_mbps, delay_ms);
+    
+    0 // 정상 처리 반환
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     
-    // Vantage-5G 데이터 평면이 핀(Pin)해둔 커널 맵 경로
-    let map_path = CString::new("/sys/fs/bpf/tc/globals/tenant_bw_map")?;
-
-    // 1. [Low-level] 핀(Pin)된 커널 맵의 File Descriptor 획득
-    let fd = unsafe { libbpf_sys::bpf_obj_get(map_path.as_ptr()) };
-    if fd < 0 {
-        bail!("Failed to open pinned map. Vantage-5G 데이터 평면이 정상적으로 부착되었는지 확인하십시오.");
-    }
-
     match &cli.command {
         Commands::Set { tenant, bw_mbps } => {
-            // Mbps를 bps로 변환
-            let target_bps: u64 = bw_mbps * 1_000_000;
+            let map_path = CString::new("/sys/fs/bpf/tc/globals/tenant_bw_map")?;
+            let fd = unsafe { libbpf_sys::bpf_obj_get(map_path.as_ptr()) };
+            if fd < 0 { bail!("Failed to open tenant_bw_map. eBPF 데이터 평면 확인 요망."); }
             
+            let target_bps: u64 = bw_mbps * 1_000_000;
             let key = tenant.to_ne_bytes();
             let value = target_bps.to_ne_bytes();
 
-            // 2. [Low-level] BPF Syscall을 통한 메모리 직접 업데이트
             let ret = unsafe {
-                libbpf_sys::bpf_map_update_elem(
-                    fd,
-                    key.as_ptr() as *const _,
-                    value.as_ptr() as *const _,
-                    libbpf_sys::BPF_ANY.into(),
-                )
+                libbpf_sys::bpf_map_update_elem(fd, key.as_ptr() as *const _, value.as_ptr() as *const _, libbpf_sys::BPF_ANY.into())
             };
-
-            if ret != 0 {
-                bail!("Map update failed with error code: {}", ret);
-            }
-
-            if *bw_mbps == 0 {
-                println!("[Vantage-5G] 🛑 Tenant {} is now BLOCKED (0 Mbps).", tenant);
-            } else {
-                println!("[Vantage-5G] 🚀 Tenant {} bandwidth set to {} Mbps.", tenant, bw_mbps);
-            }
+            if ret != 0 { bail!("Update failed."); }
+            println!("[Vantage-5G] 🚀 Tenant {} bandwidth set to {} Mbps.", tenant, bw_mbps);
         }
         Commands::Reset { tenant } => {
+            let map_path = CString::new("/sys/fs/bpf/tc/globals/tenant_bw_map")?;
+            let fd = unsafe { libbpf_sys::bpf_obj_get(map_path.as_ptr()) };
+            if fd < 0 { bail!("Failed to open tenant_bw_map."); }
+
             let key = tenant.to_ne_bytes();
-            
-            // 3. [Low-level] 맵 엔트리 삭제
-            let ret = unsafe {
-                libbpf_sys::bpf_map_delete_elem(
-                    fd,
-                    key.as_ptr() as *const _,
-                )
-            };
-            
-            if ret == 0 {
-                println!("[Vantage-5G] 🔓 Tenant {} policy removed (Unlimited).", tenant);
-            } else {
-                println!("[Vantage-5G] ⚠️ Failed to reset. 해당 테넌트를 맵에서 찾을 수 없습니다.");
+            unsafe { libbpf_sys::bpf_map_delete_elem(fd, key.as_ptr() as *const _) };
+            println!("[Vantage-5G] 🔓 Tenant {} policy removed.", tenant);
+        }
+        Commands::Monitor => {
+            // Ring Buffer 맵의 File Descriptor 획득
+            let map_path = CString::new("/sys/fs/bpf/tc/globals/telemetry_rb")?;
+            let fd = unsafe { libbpf_sys::bpf_obj_get(map_path.as_ptr()) };
+            if fd < 0 { 
+                bail!("Failed to open telemetry_rb. eBPF 코드가 정상 로드되었는지 확인하십시오."); 
             }
+
+            println!("[Vantage-5G] 📡 BPF Ring Buffer 텔레메트리 수신 개시... (Ctrl+C 종료)");
+
+            // 커널 버퍼와 Rust 콜백 함수 연결
+            let rb = unsafe {
+                libbpf_sys::ring_buffer__new(fd, Some(handle_event), std::ptr::null_mut(), std::ptr::null())
+            };
+
+            if rb.is_null() {
+                bail!("Failed to create ring buffer object.");
+            }
+
+            // 폴링 루프 (커널 버퍼를 주기적으로 확인)
+            loop {
+                let err = unsafe { libbpf_sys::ring_buffer__poll(rb, 100) }; // 100ms 타임아웃
+                if err < 0 {
+                    println!("Poll error: {}", err);
+                    break;
+                }
+            }
+            
+            unsafe { libbpf_sys::ring_buffer__free(rb) };
         }
     }
-
     Ok(())
 }
