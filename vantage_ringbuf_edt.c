@@ -1,8 +1,12 @@
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
 
 #ifndef TC_ACT_UNSPEC
 #define TC_ACT_UNSPEC (-1)
+#endif
+#ifndef ETH_P_IP
+#define ETH_P_IP 0x0800
 #endif
 #ifndef LIBBPF_PIN_BY_NAME
 #define LIBBPF_PIN_BY_NAME 1
@@ -24,18 +28,35 @@ struct {
 
 SEC("tc")
 int vantage_telemetry_sniffer(struct __sk_buff *skb) {
-    // 🚨 [조건문 완전 삭제] 헤더 검사 없이 패킷이 닿는 즉시 무조건 캡처
+    void *data_end = (void *)(long)skb->data_end;
+    void *data     = (void *)(long)skb->data;
+    struct ethhdr *eth = data;
+
+    // 헤더 파싱 실패 시 패킷을 드롭하지 않고 그냥 통과시킴
+    if ((void *)(eth + 1) > data_end) return TC_ACT_UNSPEC;
+
+    // Ring Buffer 이벤트 할당
     struct telemetry_event *evt = bpf_ringbuf_reserve(&telemetry_rb, sizeof(*evt), 0);
-    if (evt) {
-        evt->tenant_id = 9999; // 테스트 성공을 증명할 매직 넘버 '9999'
-        evt->pkt_len = skb->len;
-        evt->target_bps = 0;
-        evt->delay_ns = 0;
-        evt->timestamp_ns = bpf_ktime_get_ns();
-        bpf_ringbuf_submit(evt, 0);
+    if (!evt) return TC_ACT_UNSPEC;
+
+    // 1. 기본 정보 세팅 (모든 패킷 공통)
+    evt->tenant_id = 0; // 기본값 (Non-IPv4)
+    evt->pkt_len = skb->len;
+    evt->target_bps = 0;
+    evt->delay_ns = 0;
+    evt->timestamp_ns = bpf_ktime_get_ns();
+
+    // 2. IPv4인 경우에만 IP 주소(Tenant 식별자) 추출
+    if (eth->h_proto == bpf_htons(ETH_P_IP)) {
+        struct iphdr *ip = (void *)(eth + 1);
+        if ((void *)(ip + 1) <= data_end) {
+            // Source IP 주소를 정수형으로 저장
+            evt->tenant_id = ip->saddr;
+        }
     }
-    
-    // 관측 후 흔적 없이 패스
+
+    // 데이터 전송 및 패킷 무사 통과
+    bpf_ringbuf_submit(evt, 0);
     return TC_ACT_UNSPEC; 
 }
 
