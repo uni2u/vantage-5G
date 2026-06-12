@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::ffi::CString;
 use std::os::raw::{c_int, c_void};
+use std::net::Ipv4Addr;
 
 // K8s API 패키지
 use kube::{api::{Api, Patch, PatchParams}, Client};
@@ -40,10 +41,17 @@ struct TelemetryEvent {
 
 unsafe extern "C" fn handle_event(_ctx: *mut c_void, data: *mut c_void, _size: u64) -> c_int {
     let event = std::ptr::read(data as *const TelemetryEvent);
+    
+    // 🚨 [추가] 커널 메모리에서 올라온 IP 바이트 배열을 표준 IPv4 포맷으로 변환
+    let ip_bytes = event.tenant_id.to_ne_bytes();
+    let ip_addr = Ipv4Addr::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
+
     let target_mbps = event.target_bps / 1_000_000;
     let delay_ms = event.delay_ns as f64 / 1_000_000.0;
-    println!("[📡 EVENT] Tenant: {} | 📦 {} Bytes | 🚀 {} Mbps | ⏱️ Delay: {:.2} ms", 
-        event.tenant_id, event.pkt_len, target_mbps, delay_ms);
+    
+    // Tenant ID 대신 실제 Pod IP로 출력
+    println!("[📡 EVENT] Pod IP: {} | 📦 {} Bytes | 🚀 {} Mbps | ⏱️ Delay: {:.2} ms", 
+        ip_addr, event.pkt_len, target_mbps, delay_ms);
     0
 }
 
