@@ -38,7 +38,7 @@ struct {
     __uint(max_entries, 512000);
     __uint(map_flags, BPF_F_NO_PREALLOC | BPF_F_RDONLY_PROG);
     __uint(pinning, LIBBPF_PIN_BY_NAME);
-} cilium_ipcache_v2 SEC(".maps");
+} cilium_ipcache_ SEC(".maps");
 
 // --- [Phase 3] EDT 상태 저장용 맵 ---
 struct {
@@ -96,7 +96,7 @@ int vantage_telemetry_pacing(struct __sk_buff *skb) {
     // [수정 후] 타겟을 daddr에서 saddr(소스 IP)로 변경
     __builtin_memcpy(&key.ip_address, &ip->saddr, sizeof(ip->saddr));
 
-    struct cilium_ipcache_value *val = bpf_map_lookup_elem(&cilium_ipcache_v2, &key);
+    struct cilium_ipcache_value *val = bpf_map_lookup_elem(&cilium_ipcache_, &key);
     
     // 식별 성공 시 통제 로직 개입
     if (val) {
