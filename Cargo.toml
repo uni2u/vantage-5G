@@ -5,8 +5,11 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.4", features = ["derive"] }
-libbpf-sys = "1.4" # without bpftool using vantage CLI
 anyhow = "1.0"
+
+# 로우레벨 sys 바인딩 위에 고수준 rs 매니저를 중첩 레이어로 쌓습니다.
+libbpf-sys = "1.4"
+libbpf-rs = "0.23"
 
 tokio = { version = "1.34", features = ["macros", "rt-multi-thread"] }
 kube = { version = "0.87", features = ["runtime", "client", "derive"] }
