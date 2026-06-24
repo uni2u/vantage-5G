@@ -250,10 +250,32 @@ git clone https://github.com/uni2u/vantage-5G.git
 cd vantage-5G
 ```
 
-Build the Rust CLI:
+Check the local build environment:
 
 ```bash
-cargo build --release
+make check
+```
+
+Build both the eBPF object and the Rust CLI:
+
+```bash
+make build
+```
+
+The `make build` command performs the following steps:
+
+```
+1. Generate vmlinux.h from /sys/kernel/btf/vmlinux
+2. Compile vantage_ringbuf_edt.c into vantage_ringbuf_edt.o
+3. Build the Rust CLI with cargo build --release
+```
+
+Verify the build artifacts:
+
+```bash
+ls -lh vmlinux.h
+ls -lh vantage_ringbuf_edt.o
+ls -lh target/release/vantage-5G
 ```
 
 Verify the binary:
@@ -269,8 +291,6 @@ set
 reset
 monitor
 ```
-
-## 7. Build the eBPF Object
 
 The current `monitor` command expects the following object file in the project root:
 
@@ -300,7 +320,7 @@ Verify the object file:
 ls -lh vantage_ringbuf_edt.o
 ```
 
-## 8. Deploy the Test Service Pod
+## 7. Deploy the Test Service Pod
 
 Deploy the provided iperf3 server:
 
@@ -324,7 +344,7 @@ echo "POD_NAME=$POD_NAME"
 echo "POD_IP=$POD_IP"
 ```
 
-## 9. Run Vantage Monitor
+## 8. Run Vantage Monitor
 
 The monitor command requires root privileges.
 
@@ -363,7 +383,7 @@ If accessing from another machine:
 curl http://<NODE_IP>:9090/metrics | grep vantage
 ```
 
-## 10. Attach the Packet Sniffer to the Pod Interface
+## 9. Attach the Packet Sniffer to the Pod Interface
 
 Run the helper script in terminal 2:
 
@@ -391,7 +411,7 @@ tc filter show dev <TARGET_DEV> egress
 
 Replace `<TARGET_DEV>` with the interface printed by `ready.sh`.
 
-## 11. Test Baseline Throughput
+## 10. Test Baseline Throughput
 
 From a client that can reach the service Pod IP, run:
 
@@ -421,7 +441,7 @@ Also verify Prometheus metrics:
 curl http://127.0.0.1:9090/metrics | grep vantage_tenant_tx
 ```
 
-## 12. Set Bandwidth Limit
+## 11. Set Bandwidth Limit
 
 Use the `set` command to apply an egress bandwidth limit to the service Pod.
 
@@ -461,7 +481,7 @@ iperf3 -c "$POD_IP" -R
 
 The measured throughput should be close to the configured bandwidth limit, depending on kernel, Cilium configuration, routing mode, node device, and test path.
 
-## 13. Reset Bandwidth Limit
+## 12. Reset Bandwidth Limit
 
 Remove the bandwidth annotation:
 
@@ -492,7 +512,7 @@ iperf3 -c "$POD_IP" -R
 
 The throughput should no longer be constrained by the previously configured Vantage-5G bandwidth limit.
 
-## 14. Prometheus Integration
+## 13. Prometheus Integration
 
 Vantage-5G exposes metrics on:
 
@@ -539,9 +559,9 @@ up{job="vantage-5g"}
 
 Grafana should be connected after Prometheus scraping and PromQL validation are confirmed.
 
-## 15. CLI Reference
+## 14. CLI Reference
 
-### 15.1 `set`
+### 14.1 `set`
 
 Set egress bandwidth for a Pod.
 
@@ -567,7 +587,7 @@ This patches the following Pod annotation:
 kubernetes.io/egress-bandwidth: "100M"
 ```
 
-### 15.2 `reset`
+### 14.2 `reset`
 
 Remove egress bandwidth control from a Pod.
 
@@ -585,7 +605,7 @@ Example:
   --namespace default
 ```
 
-### 15.3 `monitor`
+### 14.3 `monitor`
 
 Start the eBPF telemetry and Prometheus exporter.
 
@@ -601,9 +621,9 @@ vantage_ringbuf_edt.o
 
 to exist in the project root.
 
-## 16. Troubleshooting
+## 15. Troubleshooting
 
-### 16.1 `vantage_ringbuf_edt.o` not found
+### 15.1 `vantage_ringbuf_edt.o` not found
 
 Build the eBPF object first:
 
@@ -617,7 +637,7 @@ sudo clang -O2 -g -target bpf \
   -o vantage_ringbuf_edt.o
 ```
 
-### 16.2 `K8s connection failed`
+### 15.2 `K8s connection failed`
 
 Check kubeconfig:
 
@@ -632,7 +652,7 @@ If needed:
 export KUBECONFIG=/etc/kubernetes/admin.conf
 ```
 
-### 16.3 Bandwidth limit does not apply
+### 15.3 Bandwidth limit does not apply
 
 Check Cilium Bandwidth Manager:
 
@@ -652,7 +672,7 @@ Check Cilium bandwidth state:
 kubectl -n kube-system exec ds/cilium -- cilium-dbg bpf bandwidth list
 ```
 
-### 16.4 `ready.sh` cannot find the Pod
+### 15.4 `ready.sh` cannot find the Pod
 
 Check that the iperf3 Pod exists:
 
@@ -666,7 +686,7 @@ If no Pod exists:
 kubectl apply -f iperf3-deployment.yaml
 ```
 
-### 16.5 No telemetry events
+### 15.5 No telemetry events
 
 Check that `monitor` is running:
 
@@ -687,7 +707,7 @@ sudo ls -l /sys/fs/bpf/vantage
 sudo ls -l /sys/fs/bpf/tc/globals
 ```
 
-### 16.6 Permission denied
+### 15.6 Permission denied
 
 Run monitor with root privileges:
 
@@ -695,7 +715,7 @@ Run monitor with root privileges:
 sudo ./target/release/vantage-5G monitor
 ```
 
-## 17. Known Limitations
+## 16. Known Limitations
 
 Current limitations:
 
@@ -710,7 +730,7 @@ Current limitations:
 * Vantage-5G should not directly compete with or replace Cilium.
 * Direct manipulation of Cilium-managed BPF maps is treated as experimental and should not be used as the stable control path.
 
-## 18. Design Notes
+## 17. Design Notes
 
 Vantage-5G is intentionally designed as a Cilium-compatible auxiliary tool.
 
@@ -734,7 +754,7 @@ Vantage CLI
 
 The experimental path is not the default because Cilium owns the Kubernetes datapath, BPF map lifecycle, endpoint identity, and datapath reconciliation.
 
-## 19. Future Work
+## Future Work
 
 Planned directions:
 
@@ -764,7 +784,7 @@ vantage-5G apply-policy \
 * Automatic eBPF build integration.
 * Safer and more robust interface attachment logic.
 
-## 20. Cleanup
+## Cleanup
 
 Remove the test deployment:
 
@@ -786,7 +806,7 @@ sudo rm -f /sys/fs/bpf/tc/globals/telemetry_rb
 sudo rm -f /sys/fs/bpf/tc/globals/tcp_retransmit_counter
 ```
 
-## 21. Project Summary
+## Project Summary
 
 Vantage-5G is a manual Rust CLI PoC for service-side QoS control in black-box 5G Core environments.
 
