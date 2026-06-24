@@ -1,5 +1,7 @@
 # vatage-5G
 
+## Motivation
+
 Vantage-5G는 실제 구축 환경의 제약에서 시작되었다.
 
 만약 5G Core와 서비스 워크로드가 하나의 Kubernetes 클러스터 또는 Multus/Cilium 기반의 통합 네트워크 도메인 안에 있다면, Cilium의 native bandwidth 관리 기능을 이용하여 서비스 트래픽의 대역폭을 직접 제어할 수 있다. 이 경우 5G Core datapath, 서비스 datapath, CNI 수준의 QoS 제어 지점이 동일한 관리 경계 안에 존재한다.
