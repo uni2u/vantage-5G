@@ -1,5 +1,15 @@
 # vatage-5G
 
+Vantage-5G는 실제 구축 환경의 제약에서 시작되었다.
+
+만약 5G Core와 서비스 워크로드가 하나의 Kubernetes 클러스터 또는 Multus/Cilium 기반의 통합 네트워크 도메인 안에 있다면, Cilium의 native bandwidth 관리 기능을 이용하여 서비스 트래픽의 대역폭을 직접 제어할 수 있다. 이 경우 5G Core datapath, 서비스 datapath, CNI 수준의 QoS 제어 지점이 동일한 관리 경계 안에 존재한다.
+
+그러나 본 프로젝트가 대상으로 하는 환경에서는 5G Core가 타 담당 영역으로 분리되어 있으며, 서비스 도메인에서 해당 5G Core의 Kubernetes, Multus, CNI, UPF, QoS 정책 평면에 접근하거나 연결할 방법이 없다.
+
+따라서 Vantage-5G는 Cilium을 대체하기 위한 도구가 아니라, 5G Core를 직접 제어할 수 없는 블랙박스 환경에서 서비스 Kubernetes 도메인만을 이용해 서비스→단말 방향 bandwidth를 동적으로 조율하기 위한 service-side QoS 보조 도구로 시작되었다.
+
+---
+
 ## Phase 1: eBPF-Cilium 제어 평면 연동 A to Z 플레이북
 
 ### Rust 컴파일러 및 빌드 툴체인 설치
