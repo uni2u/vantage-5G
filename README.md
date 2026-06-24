@@ -262,14 +262,6 @@ Build both the eBPF object and the Rust CLI:
 make build
 ```
 
-The `make build` command performs the following steps:
-
-```
-1. Generate vmlinux.h from /sys/kernel/btf/vmlinux
-2. Compile vantage_ringbuf_edt.c into vantage_ringbuf_edt.o
-3. Build the Rust CLI with cargo build --release
-```
-
 Verify the build artifacts:
 
 ```bash
