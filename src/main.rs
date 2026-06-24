@@ -13,18 +13,18 @@ use lazy_static::lazy_static;
 // 🚨 [혁신적 구조] Prometheus 메트릭 전역 레지스트리 선언 (TCP 재전송 게이지 추가)
 lazy_static! {
     static ref TENANT_BYTES_TOTAL: CounterVec = register_counter_vec!(
-        opts!("vantage_tenant_tx_bytes_total", "5G 테넌트 누적 전송 바이트 수"),
+        opts!("vantage_tenant_tx_bytes_total", "5G tenant accumulated transmit bytes total"),
         &["pod_ip"]
     ).unwrap();
 
     static ref TENANT_PACKETS_TOTAL: CounterVec = register_counter_vec!(
-        opts!("vantage_tenant_tx_packets_total", "5G 테넌트 누적 전송 패킷 수"),
+        opts!("vantage_tenant_tx_packets_total", "5G tenant accumulated transmit packets total"),
         &["pod_ip"]
     ).unwrap();
 
     // 💡 [새로운 무기] 커널 글로벌 TCP 재전송 누적 감시용 Prometheus 게이지
     static ref NODE_TCP_RETRANSMIT_TOTAL: Gauge = register_gauge!(
-        opts!("vantage_node_tcp_retransmit_total", "5G 커널 글로벌 누적 TCP 재전송 수")
+        opts!("vantage_node_tcp_retransmit_total", "5G node accumulated retransmit packets total")
     ).unwrap();
 }
 
@@ -151,6 +151,9 @@ async fn main() -> Result<()> {
 
                 let ring_buffer = rb_builder.build().context("[-] 커널 링버퍼 빌드 실패")?;
                 println!("[+] 3단계: 하이브리드 가상 관측망 통합 청취 루프 개통.");
+
+                // 🚨 [정밀 주입] 초기 기동 시 0 값 강제 주입으로 프로메테우스 엔드포인트에 즉시 노출 선언
+                NODE_TCP_RETRANSMIT_TOTAL.set(0.0);
 
                 // 4. [시분할 아키텍처] 100ms 폴링 루프 내 1초 주기 Per-CPU 맵 스크래핑 엔진
                 let counter_map = loaded_obj.map("tcp_retransmit_counter").context("[-] 카운터 맵 탐색 실패")?;
