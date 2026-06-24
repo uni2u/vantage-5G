@@ -157,3 +157,40 @@ kubectl describe pod iperf-server-a | grep egress-bandwidth
 ./target/release/vantage-5G reset --pod iperf-server-xxx --namespace default
 ```
 
+---
+
+## 🚀 Roadmap & Future Work: Agentic AI & MCP Integration (TODO)
+
+본 프로젝트의 최종 진화 목적지는 인간 엔지니어의 개입 없이, 커널 심층 미세 신호를 상위 AI 가 실시간 추론하여 인프라를 자율 방어하는 **'Zero-Touch 자율 네트워킹 제어 평면'**을 완성하는 것입니다. 이를 위해 아래 고도화 작업을 주도적으로 진행하고 있으며, 오픈소스 기여를 환영합니다.
+
+### 🟥 Task 1: Rust-Native Model Context Protocol (MCP) Host/Client Bridge 구현
+* **목적:** 상위 대형 언어 모델(LLM) 및 AI 에이전트(NRAG 두뇌 레이어)가 `vantage-5G` 인프라를 자신의 도구(Tools) 및 리소스(Resources)로 직접 인식하고 조작할 수 있는 표준 규격 통로 개방.
+* **상세 설계:**
+  * JSON-RPC 2.0 기반의 MCP 비동기 통신 규격 프로토콜 스택을 Rust 매니저 내부에 이식.
+  * AI가 시스템 콜 계층으로 진입할 수 있도록 `vantage-5G set/reset` 명령을 MCP Tool로 랩핑(Wrapping) 바인딩.
+
+### 🟥 Task 2: 슬라이딩 윈도우 기반 의미론적 문맥 응축 엔진 (Semantic Aggregator) 이식
+* **목적:** 원시 패킷 단위의 Ring Buffer 이벤트 플러딩(Event Flooding)으로 인한 제어 평면 I/O 병목 및 AI Context Window 고갈을 원천 차단.
+* **상세 설계:**
+  * eBPF 콜백은 백그라운드에서 원자적 카운터만 초고속 누적하고, 유저 공간의 Tokio 타이머 스레드가 1초 주기로 데이터를 덤프.
+  * 1초간 수집된 처리량(Throughput), pps, 평균 패킷 크기 및 `fentry` 기반 TCP 재전송 누적 델타 값을 융합하여 의미론적 고차원 JSON Context 가공 엔진 구축.
+
+### 🟥 Task 3: Closed-Loop 자율 통제 방어 알고리즘 실증
+* **목적:** AI 가 미세 신호를 기반으로 네트워크 혼잡(Congestion)과 DoS 등 악성 공격(Anomaly)을 구분하여 대역폭 교살 정책을 실시간 피드백 루프로 집행.
+* **상세 설계:**
+  * MCP 리소스를 통해 JSON 문맥을 실시간 구독 중인 Agentic AI가 "TCP Retransmit 카운트 급증 + pps 폭발" 감지 시, 배후 라우팅 유실 혹은 내부 침해 자산의 데이터 탈취 징후로 정밀 추론.
+  * AI가 직접 MCP 도구를 타격하여 해당 파드의 대역폭을 50 Mbps로 긴급 압착(Throttling) 조치하는 폐루프(Closed-Loop) 자동화 검증.
+
+---
+
+## 📡 Current Status & Verified Benchmarks (Context Anchor)
+
+1. **L3/L4 Data Plane 무결성 검증 완료:** * 멀티 노드 가상화 환경에서 Cross-Node 라우팅 테이블 동기화 완료 (`sudo ip route add 10.0.0.0/24 via <VM2_IP> dev <Dev>`).
+   * VM1 사격기에서 타겟 파드로의 기저 ICMP 통신 무결성 및 L4 `iperf3` 역방향 소켓 통로 개통 완료.
+2. **eBPF-Rust 하이브리드 수집 매니저 실증 완료:**
+   * 호스트 `bpftool` 제약을 우회하여 `libbpf-rs`를 이용한 `fentry/tcp_retransmit_skb` 커널 트램펄린 자율 용접 성공.
+   * `vantage_tenant_tx_bytes_total` 및 `vantage_tenant_tx_packets_total` 메트릭을 통해 평균 66 Bytes 대역의 순수 TCP ACK 제어 스트림 포착 성공 및 9090 포트 프로메테우스 익스포터 정상 유출 확인.
+3. **Control Plane 제어 집행력 실증 완료:**
+   * `vantage-5G set --bw-mbps 100` 명령을 통한 K8s API 패치 무결성 입증.
+   * Cilium EDT(Earliest Departure Time) 매커니즘이 발동하여 VM1 벤치마크 결과가 대역폭 상한선인 `97.9 Mbits/sec` 근처에서 칼같이 셰이핑(Capping)되는 데이터 무결성 물리적 확인 완료.
+  
