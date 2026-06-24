@@ -93,10 +93,6 @@ sudo ip route add 10.0.0.0/24 via 192.168.56.10 dev enp0s8
 
 ```bash
 # [VM2 터미널 - 창 1]
-# 1. 기존 데이터 평면 훅 제거 (ready.sh의 클린업 로직 강제 활용)
-sudo tc qdisc del dev $TARGET_DEV clsact 2>/dev/null || true
-
-# 2. Rust 제어 평면 모니터 기동 (BPFFS 청정화 및 링버퍼/카운터 맵 재생성)
 sudo ./target/release/vantage-5G monitor
 ```
 
