@@ -156,6 +156,7 @@ sudo apt-get install -y \
   llvm \
   libbpf-dev \
   libelf-dev \
+  bpftool \
   linux-tools-common \
   linux-tools-generic \
   pkg-config \
@@ -187,6 +188,8 @@ Install Helm if needed:
 curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 helm version
 ```
+
+Install `kubectl` if needed, following the official Kubernetes documentation for your OS.
 
 Verify Kubernetes access:
 
