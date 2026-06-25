@@ -735,6 +735,8 @@ Vantage CLI
 
 The experimental path is not the default because Cilium owns the Kubernetes datapath, BPF map lifecycle, endpoint identity, and datapath reconciliation.
 
+---
+
 ## Future Work
 
 Planned directions:
