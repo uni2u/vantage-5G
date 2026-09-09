@@ -1,196 +1,378 @@
-use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+// Vantage-5G v0.2 CLI
+// Toy-project scope: administrator manually sets per-UE RX/TX bandwidth
+// limits enforced by XDP (RX policer) and tc-bpf EDT (TX pacer) attached
+// to the service-node N6-facing NIC.
+
+use std::mem::size_of;
 use std::net::Ipv4Addr;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
-// K8s API 및 Prometheus 패키지 개방
-use kube::{api::{Api, Patch, PatchParams}, Client};
-use k8s_openapi::api::core::v1::Pod;
-use serde_json::json;
-use prometheus::{opts, register_counter_vec, register_gauge, CounterVec, Gauge};
+use anyhow::{anyhow, bail, Context, Result};
+use clap::{Parser, Subcommand};
 use lazy_static::lazy_static;
+use libbpf_rs::{MapFlags, MapHandle, ObjectBuilder};
+use prometheus::{opts, register_counter_vec, register_gauge_vec, CounterVec, GaugeVec};
 
-// 🚨 [혁신적 구조] Prometheus 메트릭 전역 레지스트리 선언 (TCP 재전송 게이지 추가)
+// ---------- Pinned artifact paths ----------
+const BPF_PIN_DIR: &str = "/sys/fs/bpf/vantage";
+
+const OBJ_RX: &str = "vantage_rx_policer.o";
+const OBJ_TX: &str = "vantage_tx_pacer.o";
+
+const PROG_RX_NAME: &str = "vantage_rx_policer";
+const PROG_TX_NAME: &str = "vantage_tx_pacer";
+
+const MAP_POLICY: &str = "ue_policy_map";
+const MAP_STATS:  &str = "ue_stats_map";
+const MAP_RXST:   &str = "rx_state_map";
+const MAP_TXTS:   &str = "tx_tstamp_map";
+
+// ---------- Wire structs (must match the .c files exactly) ----------
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+struct UePolicy {
+    rx_bps: u64,
+    tx_bps: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+struct UeStats {
+    rx_bytes:   u64,
+    rx_packets: u64,
+    rx_drops:   u64,
+    tx_bytes:   u64,
+    tx_packets: u64,
+    tx_drops:   u64,
+}
+
+fn as_bytes<T: Copy>(v: &T) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(v as *const T as *const u8, size_of::<T>()) }
+}
+
+fn from_bytes<T: Copy + Default>(b: &[u8]) -> T {
+    assert!(b.len() >= size_of::<T>());
+    let mut out = T::default();
+    unsafe {
+        std::ptr::copy_nonoverlapping(b.as_ptr(), &mut out as *mut T as *mut u8, size_of::<T>());
+    }
+    out
+}
+
+fn ue_ip_key(ip: Ipv4Addr) -> [u8; 4] {
+    // Map keys are stored in network byte order (matches saddr/daddr in BPF).
+    ip.octets()
+}
+
+// ---------- Prometheus metrics ----------
 lazy_static! {
-    static ref TENANT_BYTES_TOTAL: CounterVec = register_counter_vec!(
-        opts!("vantage_tenant_tx_bytes_total", "5G tenant accumulated transmit bytes total"),
-        &["pod_ip"]
+    static ref M_RX_BYTES: CounterVec = register_counter_vec!(
+        opts!("vantage_ue_rx_bytes_total", "Per-UE uplink bytes admitted by RX policer"),
+        &["ue_ip"]
     ).unwrap();
-
-    static ref TENANT_PACKETS_TOTAL: CounterVec = register_counter_vec!(
-        opts!("vantage_tenant_tx_packets_total", "5G tenant accumulated transmit packets total"),
-        &["pod_ip"]
+    static ref M_RX_PACKETS: CounterVec = register_counter_vec!(
+        opts!("vantage_ue_rx_packets_total", "Per-UE uplink packets admitted by RX policer"),
+        &["ue_ip"]
     ).unwrap();
-
-    // 💡 [새로운 무기] 커널 글로벌 TCP 재전송 누적 감시용 Prometheus 게이지
-    static ref NODE_TCP_RETRANSMIT_TOTAL: Gauge = register_gauge!(
-        opts!("vantage_node_tcp_retransmit_total", "5G node accumulated retransmit packets total")
+    static ref M_RX_DROPS: CounterVec = register_counter_vec!(
+        opts!("vantage_ue_rx_drops_total", "Per-UE uplink packets dropped by RX policer"),
+        &["ue_ip"]
+    ).unwrap();
+    static ref M_TX_BYTES: CounterVec = register_counter_vec!(
+        opts!("vantage_ue_tx_bytes_total", "Per-UE downlink bytes paced by TX pacer"),
+        &["ue_ip"]
+    ).unwrap();
+    static ref M_TX_PACKETS: CounterVec = register_counter_vec!(
+        opts!("vantage_ue_tx_packets_total", "Per-UE downlink packets paced by TX pacer"),
+        &["ue_ip"]
+    ).unwrap();
+    static ref M_TX_DROPS: CounterVec = register_counter_vec!(
+        opts!("vantage_ue_tx_drops_total", "Per-UE downlink packets dropped (killswitch)"),
+        &["ue_ip"]
+    ).unwrap();
+    static ref M_POLICY_RX: GaugeVec = register_gauge_vec!(
+        opts!("vantage_ue_policy_rx_bps", "Configured per-UE RX bandwidth (bps, 0=uncapped)"),
+        &["ue_ip"]
+    ).unwrap();
+    static ref M_POLICY_TX: GaugeVec = register_gauge_vec!(
+        opts!("vantage_ue_policy_tx_bps", "Configured per-UE TX bandwidth (bps, 0=killswitch)"),
+        &["ue_ip"]
     ).unwrap();
 }
 
+// ---------- CLI ----------
 #[derive(Parser)]
-#[command(name = "vantage-cli", about = "Vantage-5G Hybrid Orchestrator")]
+#[command(name = "vantage-5G", version, about = "Vantage-5G per-UE RX/TX bandwidth control")]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    cmd: Cmd,
 }
 
 #[derive(Subcommand)]
-enum Commands {
+enum Cmd {
+    /// Load & pin the RX/TX BPF objects (idempotent). Programs remain in the
+    /// kernel after this command exits; use setup.sh to attach them to an iface.
+    Load,
+
+    /// Remove all Vantage pins (detaches nothing; run detach.sh first if attached).
+    Unload,
+
+    /// Set per-UE RX/TX bandwidth limits (in Mbps). tx_mbps=0 means "block DL".
     Set {
-        #[arg(short, long)] pod: String,
-        #[arg(short, long, default_value = "default")] namespace: String,
-        #[arg(short, long)] bw_mbps: u64,
+        #[arg(long)] ue_ip: Ipv4Addr,
+        #[arg(long)] rx_mbps: u64,
+        #[arg(long)] tx_mbps: u64,
     },
+
+    /// Clear the policy for a UE (drop from map; traffic bypasses shaping).
     Reset {
-        #[arg(short, long)] pod: String,
-        #[arg(short, long, default_value = "default")] namespace: String,
+        #[arg(long)] ue_ip: Ipv4Addr,
     },
-    Monitor,
+
+    /// Print every UE currently in the policy map.
+    List,
+
+    /// Print RX/TX counters for one UE (or all UEs when --ue-ip is omitted).
+    Stats {
+        #[arg(long)] ue_ip: Option<Ipv4Addr>,
+    },
+
+    /// Run the Prometheus exporter (foreground). Scrapes pinned stats maps.
+    Monitor {
+        #[arg(long, default_value_t = 9090)] port: u16,
+        #[arg(long, default_value_t = 1000)] scrape_ms: u64,
+    },
 }
 
-// 커널 C 구조체와 100% 동기화되는 메모리 패딩 명세
-#[repr(C)]
-struct TelemetryEvent {
-    tenant_id: u32, 
-    pkt_len: u32,
-    target_bps: u64,
-    delay_ns: u64,
-    timestamp_ns: u64,
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
-    
-    match &cli.command {
-        Commands::Set { pod, namespace, bw_mbps } => {
-            let client = Client::try_default().await.context("K8s 연결 실패")?;
-            let pods: Api<Pod> = Api::namespaced(client, namespace); 
-            let patch = json!({
-                "metadata": {"annotations": {"kubernetes.io/egress-bandwidth": format!("{}M", bw_mbps)}}
-            });
-            pods.patch(pod, &PatchParams::apply("vantage-cli"), &Patch::Merge(&patch)).await?;
-            println!("[Vantage-5G] 🚀 K8s Pod '{}' 대역폭 {} Mbps 제어 선포 (Cilium EDT).", pod, bw_mbps);
-        }
-        
-        Commands::Reset { pod, namespace } => {
-            let client = Client::try_default().await?;
-            let pods: Api<Pod> = Api::namespaced(client, namespace); 
-            let patch = json!({
-                "metadata": {"annotations": {"kubernetes.io/egress-bandwidth": serde_json::Value::Null}}
-            });
-            pods.patch(pod, &PatchParams::apply("vantage-cli"), &Patch::Merge(&patch)).await?;
-            println!("[Vantage-5G] 🔓 K8s Pod '{}' 대역폭 제어 정책 해제.", pod);
-        }
-        
-        Commands::Monitor => {
-            // 1. [비동기 엔진 가동] Prometheus HTTP Exporter 서버를 9090 포트에 개방
-            tokio::spawn(async {
-                println!("[Vantage-5G] 📈 Prometheus Metrics Endpoint 가동 중: http://0.0.0.0:9090/metrics");
-                prometheus_exporter::start("0.0.0.0:9090".parse().unwrap())
-                    .expect("Prometheus Exporter 가동 실패");
-            });
+    match cli.cmd {
+        Cmd::Load                                => cmd_load(),
+        Cmd::Unload                              => cmd_unload(),
+        Cmd::Set { ue_ip, rx_mbps, tx_mbps }     => cmd_set(ue_ip, rx_mbps, tx_mbps),
+        Cmd::Reset { ue_ip }                     => cmd_reset(ue_ip),
+        Cmd::List                                => cmd_list(),
+        Cmd::Stats { ue_ip }                     => cmd_stats(ue_ip),
+        Cmd::Monitor { port, scrape_ms }         => cmd_monitor(port, scrape_ms),
+    }
+}
 
-            // 2. [오케스트레이션 영속화] 커널 제어 및 데이터 폴링용 동기 블로킹 태스크 진입
-            tokio::task::spawn_blocking(|| -> Result<()> {
-                println!("[Vantage-5G] 📡 Rust-Native libbpf 엔진 런타임 초기화...");
+// ---------- load / unload ----------
+fn cmd_load() -> Result<()> {
+    ensure_pin_dir()?;
+    load_and_pin(OBJ_RX, PROG_RX_NAME)?;
+    load_and_pin(OBJ_TX, PROG_TX_NAME)?;
+    println!("[+] Vantage-5G loaded. Pins under {}", BPF_PIN_DIR);
+    println!("    Attach with: sudo ./setup.sh <iface>");
+    Ok(())
+}
 
-                // eBPF 오브젝트 파일 직접 로드 (bpftool 완전 대체)
-                let open_obj = libbpf_rs::ObjectBuilder::default()
-                    .open_file("vantage_ringbuf_edt.o")
-                    .context("[-] eBPF 오브젝트 바이너리 오픈 실패")?;
+fn cmd_unload() -> Result<()> {
+    let root = Path::new(BPF_PIN_DIR);
+    if !root.exists() {
+        println!("[i] Nothing to remove ({} does not exist)", BPF_PIN_DIR);
+        return Ok(());
+    }
+    // Remove file pins first, then the directory. Detachment (XDP/tc) must
+    // already have been undone; otherwise the kernel keeps the objects alive
+    // and the .rmdir will just fail harmlessly.
+    for entry in std::fs::read_dir(root)? {
+        let p = entry?.path();
+        let _ = std::fs::remove_file(&p);
+    }
+    let _ = std::fs::remove_dir(root);
+    println!("[+] Vantage-5G pins removed.");
+    Ok(())
+}
 
-                let mut loaded_obj = open_obj.load().context("[-] 커널 메모리 로드 거부 (BTF/커널 버전 체크 필요)")?;
-                println!("[+] 1단계: eBPF 오브젝트 커널 주입 무결성 검증 완료.");
+fn ensure_pin_dir() -> Result<()> {
+    std::fs::create_dir_all(BPF_PIN_DIR)
+        .with_context(|| format!("mkdir {}", BPF_PIN_DIR))
+}
 
-                // 🚨 [인프라 정렬 자율화] 외부 ready.sh 및 tc 호환성을 위해 가상 파일시스템(BPFFS) 고정 강제 실행
-                let _ = std::fs::create_dir_all("/sys/fs/bpf/vantage");
-                let _ = std::fs::create_dir_all("/sys/fs/bpf/tc/globals");
+fn load_and_pin(obj_file: &str, prog_name: &str) -> Result<()> {
+    // If the program is already pinned, treat as no-op (idempotent bootstrap).
+    let prog_pin = pin_path(prog_name);
+    if prog_pin.exists() {
+        println!("[i] {} already pinned, skipping load.", prog_name);
+        return Ok(());
+    }
 
-                // 🚨 [혁신적 교정 주입] 과거 유령 핀 파일 선제 소각 (Idempotent Cleanup)
-                // 이 처리를 통해 맵 분열(Split-Brain) 현상을 원천 차단합니다.
-                let _ = std::fs::remove_file("/sys/fs/bpf/tc/globals/telemetry_rb");
-                let _ = std::fs::remove_file("/sys/fs/bpf/tc/globals/tcp_retransmit_counter");
-                let _ = std::fs::remove_file("/sys/fs/bpf/vantage/vantage_telemetry_sniffer");
+    let open = ObjectBuilder::default()
+        .open_file(obj_file)
+        .with_context(|| format!("open {}", obj_file))?;
+    let mut obj = open.load()
+        .with_context(|| format!("load {} (verifier/BTF check)", obj_file))?;
 
-                // 핀 결속 코드
-                if let Some(map) = loaded_obj.map_mut("telemetry_rb") { let _ = map.pin("/sys/fs/bpf/tc/globals/telemetry_rb"); }
-                if let Some(map) = loaded_obj.map_mut("tcp_retransmit_counter") { let _ = map.pin("/sys/fs/bpf/tc/globals/tcp_retransmit_counter"); }
-                if let Some(prog) = loaded_obj.prog_mut("vantage_telemetry_sniffer") { let _ = prog.pin("/sys/fs/bpf/vantage/vantage_telemetry_sniffer"); }
-
-                // 🚨 [핵심 돌파] bpftool 제약을 깨부수는 fentry 프로그램 자율 결속 (Auto-Attach)
-                let _fentry_link = loaded_obj.prog_mut("vantage_tcp_retransmit")
-                    .ok_or_else(|| anyhow::anyhow!("[-] vantage_tcp_retransmit 섹션 부재"))?
-                    .attach()
-                    .context("[-] fentry 커널 트램펄린 자율 용접 실패")?;
-                println!("[+] 2단계: fentry/tcp_retransmit_skb 자율 커널 링크 형성 완료.");
-
-                // 3. [고수준 고안] libbpf-rs 전용 RingBuffer 인터페이스 빌드 (Unsafe 완전 소각)
-                let mut rb_builder = libbpf_rs::RingBufferBuilder::new();
-                let telemetry_map = loaded_obj.map("telemetry_rb").context("[-] telemetry_rb 맵 탐색 실패")?;
-                
-                // Safe Rust 클로저 바인딩으로 포인터 역참조 경고(E0133) 완벽 제거
-                rb_builder.add(&telemetry_map, move |data: &[u8]| {
-                    if data.len() < std::mem::size_of::<TelemetryEvent>() { return 1; }
-                    
-                    // 정렬된 바이트 슬라이스를 구조체 참조로 안전하게 투영
-                    let event = unsafe { &*(data.as_ptr() as *const TelemetryEvent) };
-                    
-                    let ip_bytes = event.tenant_id.to_ne_bytes();
-                    let ip_addr = Ipv4Addr::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
-                    let ip_str = ip_addr.to_string();
-
-                    TENANT_BYTES_TOTAL.with_label_values(&[&ip_str]).inc_by(event.pkt_len as f64);
-                    TENANT_PACKETS_TOTAL.with_label_values(&[&ip_str]).inc();
-
-                    println!("[📡 TELEMETRY] Pod IP: {:<15} | 📦 크기: {:>4} Bytes | 메트릭 적치 완료", 
-                        ip_str, event.pkt_len);
-                    0
-                }).context("[-] 링버퍼 이벤트 콜백 등록 실패")?;
-
-                let ring_buffer = rb_builder.build().context("[-] 커널 링버퍼 빌드 실패")?;
-                println!("[+] 3단계: 하이브리드 가상 관측망 통합 청취 루프 개통.");
-
-                // 🚨 [정밀 주입] 초기 기동 시 0 값 강제 주입으로 프로메테우스 엔드포인트에 즉시 노출 선언
-                NODE_TCP_RETRANSMIT_TOTAL.set(0.0);
-
-                // 4. [시분할 아키텍처] 100ms 폴링 루프 내 1초 주기 Per-CPU 맵 스크래핑 엔진
-                let counter_map = loaded_obj.map("tcp_retransmit_counter").context("[-] 카운터 맵 탐색 실패")?;
-                let map_key = 0u32.to_ne_bytes();
-                let mut last_scrape = Instant::now();
-
-                loop {
-                    // 고속 패킷 링 버퍼 청취 (Timeout: 100ms)
-                    if let Err(e) = ring_buffer.poll(Duration::from_millis(100)) {
-                        println!("[-] 커널 관측망 폴링 파괴: {}", e);
-                        break;
-                    }
-
-                    // 리소스 경합을 막기 위한 1초 주기 시분할 커널 스크래핑 ($O(1)$ 연산)
-                    if last_scrape.elapsed() >= Duration::from_secs(1) {
-                        if let Ok(Some(value_bytes)) = counter_map.lookup(&map_key, libbpf_rs::MapFlags::empty()) {
-                            let mut total_retransmits = 0u64;
-
-                            // 모든 CPU 코어의 카운터 배열 바이트 스트림을 u64 단위로 합산
-                            for chunk in value_bytes.chunks_exact(8) {
-                                if let Ok(arr) = chunk.try_into() {
-                                    total_retransmits += u64::from_ne_bytes(arr);
-                                }
-                            }
-
-                            if total_retransmits > 0 {
-                                // Prometheus 실시간 메트릭 동기화
-                                NODE_TCP_RETRANSMIT_TOTAL.set(total_retransmits as f64);
-                                println!("[🚨 KERNEL INFRA] 커널 미세 신호 포착 -> 누적 TCP 재전송 총합: {} 회", total_retransmits);
-                            }
-                        }
-                        last_scrape = Instant::now();
-                    }
-                }
-                Ok(())
-            }).await??;
+    // Pin all maps declared with LIBBPF_PIN_BY_NAME. libbpf handles the
+    // shared-map case: the second object sees an already-pinned map and
+    // re-uses it instead of creating a new one.
+    for map_name in [MAP_POLICY, MAP_STATS, MAP_RXST, MAP_TXTS] {
+        if let Some(m) = obj.map_mut(map_name) {
+            let p = pin_path(map_name);
+            if !p.exists() {
+                m.pin(&p).with_context(|| format!("pin map {}", map_name))?;
+            }
         }
     }
+
+    let prog = obj.prog_mut(prog_name)
+        .ok_or_else(|| anyhow!("program section {} not found in {}", prog_name, obj_file))?;
+    prog.pin(&prog_pin).with_context(|| format!("pin prog {}", prog_name))?;
+
+    println!("[+] loaded {} and pinned to {}", prog_name, prog_pin.display());
     Ok(())
+}
+
+fn pin_path(name: &str) -> PathBuf {
+    PathBuf::from(BPF_PIN_DIR).join(name)
+}
+
+// ---------- map helpers ----------
+fn open_policy_map() -> Result<MapHandle> {
+    MapHandle::from_pinned_path(pin_path(MAP_POLICY))
+        .context("open pinned ue_policy_map (run `vantage-5G load` first)")
+}
+fn open_stats_map() -> Result<MapHandle> {
+    MapHandle::from_pinned_path(pin_path(MAP_STATS))
+        .context("open pinned ue_stats_map (run `vantage-5G load` first)")
+}
+
+// ---------- set / reset ----------
+fn cmd_set(ue_ip: Ipv4Addr, rx_mbps: u64, tx_mbps: u64) -> Result<()> {
+    let map = open_policy_map()?;
+    let key = ue_ip_key(ue_ip);
+    let val = UePolicy {
+        rx_bps: rx_mbps.saturating_mul(1_000_000),
+        tx_bps: tx_mbps.saturating_mul(1_000_000),
+    };
+    map.update(&key, as_bytes(&val), MapFlags::ANY)
+        .with_context(|| format!("update ue_policy_map for {}", ue_ip))?;
+    println!("[+] policy set: UE {} rx={} Mbps tx={} Mbps{}",
+             ue_ip, rx_mbps, tx_mbps,
+             if tx_mbps == 0 { "  (killswitch: DL blocked)" } else { "" });
+    Ok(())
+}
+
+fn cmd_reset(ue_ip: Ipv4Addr) -> Result<()> {
+    let map = open_policy_map()?;
+    let key = ue_ip_key(ue_ip);
+    match map.delete(&key) {
+        Ok(_)  => println!("[+] policy cleared for UE {}", ue_ip),
+        Err(e) => println!("[i] no policy for UE {} ({})", ue_ip, e),
+    }
+    Ok(())
+}
+
+// ---------- list / stats ----------
+fn cmd_list() -> Result<()> {
+    let map = open_policy_map()?;
+    println!("{:<16}  {:>12}  {:>12}", "UE_IP", "RX_Mbps", "TX_Mbps");
+    let mut n = 0usize;
+    for key in map.keys() {
+        let val_bytes = map.lookup(&key, MapFlags::empty())?
+            .ok_or_else(|| anyhow!("policy entry vanished mid-scan"))?;
+        let pol: UePolicy = from_bytes(&val_bytes);
+        let ip = key_to_ip(&key)?;
+        let killswitch = if pol.tx_bps == 0 { "  (killswitch)" } else { "" };
+        println!("{:<16}  {:>12}  {:>12}{}",
+                 ip, pol.rx_bps / 1_000_000, pol.tx_bps / 1_000_000, killswitch);
+        n += 1;
+    }
+    if n == 0 {
+        println!("(no policies configured)");
+    }
+    Ok(())
+}
+
+fn cmd_stats(filter: Option<Ipv4Addr>) -> Result<()> {
+    let map = open_stats_map()?;
+    println!("{:<16}  {:>14}  {:>10}  {:>10}  {:>14}  {:>10}  {:>10}",
+             "UE_IP", "RX_BYTES", "RX_PKTS", "RX_DROPS", "TX_BYTES", "TX_PKTS", "TX_DROPS");
+    let mut n = 0usize;
+    for key in map.keys() {
+        let ip = key_to_ip(&key)?;
+        if let Some(f) = filter { if f != ip { continue; } }
+        let val_bytes = map.lookup(&key, MapFlags::empty())?
+            .ok_or_else(|| anyhow!("stats entry vanished mid-scan"))?;
+        let s: UeStats = from_bytes(&val_bytes);
+        println!("{:<16}  {:>14}  {:>10}  {:>10}  {:>14}  {:>10}  {:>10}",
+                 ip, s.rx_bytes, s.rx_packets, s.rx_drops,
+                 s.tx_bytes, s.tx_packets, s.tx_drops);
+        n += 1;
+    }
+    if n == 0 {
+        println!("(no stats yet — is traffic flowing and the interface attached?)");
+    }
+    Ok(())
+}
+
+fn key_to_ip(k: &[u8]) -> Result<Ipv4Addr> {
+    if k.len() < 4 { bail!("short key: {} bytes", k.len()); }
+    Ok(Ipv4Addr::new(k[0], k[1], k[2], k[3]))
+}
+
+// ---------- monitor (Prometheus exporter) ----------
+fn cmd_monitor(port: u16, scrape_ms: u64) -> Result<()> {
+    let policy = open_policy_map()?;
+    let stats  = open_stats_map()?;
+
+    let bind: std::net::SocketAddr = format!("0.0.0.0:{}", port).parse()?;
+    prometheus_exporter::start(bind)
+        .with_context(|| format!("start Prometheus exporter on {}", bind))?;
+    println!("[+] Prometheus exporter listening on http://0.0.0.0:{}/metrics", port);
+    println!("    scraping BPF maps every {} ms.  Ctrl-C to stop.", scrape_ms);
+
+    loop {
+        scrape_policy_into_gauges(&policy)?;
+        scrape_stats_into_counters(&stats)?;
+        thread::sleep(Duration::from_millis(scrape_ms));
+    }
+}
+
+fn scrape_policy_into_gauges(map: &MapHandle) -> Result<()> {
+    for key in map.keys() {
+        let ip = key_to_ip(&key)?;
+        let val_bytes = match map.lookup(&key, MapFlags::empty())? {
+            Some(v) => v, None => continue,
+        };
+        let pol: UePolicy = from_bytes(&val_bytes);
+        let ip_str = ip.to_string();
+        M_POLICY_RX.with_label_values(&[&ip_str]).set(pol.rx_bps as f64);
+        M_POLICY_TX.with_label_values(&[&ip_str]).set(pol.tx_bps as f64);
+    }
+    Ok(())
+}
+
+fn scrape_stats_into_counters(map: &MapHandle) -> Result<()> {
+    // Counters are monotonic; we mirror BPF absolute values as reset-only-on-restart.
+    for key in map.keys() {
+        let ip = key_to_ip(&key)?;
+        let val_bytes = match map.lookup(&key, MapFlags::empty())? {
+            Some(v) => v, None => continue,
+        };
+        let s: UeStats = from_bytes(&val_bytes);
+        let ip_str = ip.to_string();
+        set_counter(&M_RX_BYTES,   &ip_str, s.rx_bytes);
+        set_counter(&M_RX_PACKETS, &ip_str, s.rx_packets);
+        set_counter(&M_RX_DROPS,   &ip_str, s.rx_drops);
+        set_counter(&M_TX_BYTES,   &ip_str, s.tx_bytes);
+        set_counter(&M_TX_PACKETS, &ip_str, s.tx_packets);
+        set_counter(&M_TX_DROPS,   &ip_str, s.tx_drops);
+    }
+    Ok(())
+}
+
+fn set_counter(cv: &CounterVec, label: &str, value: u64) {
+    let c = cv.with_label_values(&[label]);
+    let cur = c.get();
+    let want = value as f64;
+    if want > cur {
+        c.inc_by(want - cur);
+    }
+    // want < cur happens only when the BPF map was reset (unload/reload);
+    // in that case we accept the discrepancy for this scrape and re-align
+    // on the next tick when the BPF counter grows past `cur`.
 }
