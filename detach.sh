@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# detach.sh <iface>
+# Undo everything setup.sh did on <iface>.
+# Safe to re-run; every step tolerates "already gone".
+
+set -u
+
+IFACE="${1:-}"
+if [[ -z "${IFACE}" ]]; then
+    echo "usage: sudo $0 <iface>"
+    exit 1
+fi
+
+echo "=== 1. remove tc egress filter ==="
+sudo tc filter del dev "${IFACE}" egress 2>/dev/null || true
+
+echo "=== 2. detach XDP ==="
+sudo ip link set dev "${IFACE}" xdp off 2>/dev/null || true
+
+echo "=== 3. remove clsact qdisc ==="
+sudo tc qdisc del dev "${IFACE}" clsact 2>/dev/null || true
+
+echo "=== 4. remove root fq qdisc (kernel restores pfifo_fast) ==="
+sudo tc qdisc del dev "${IFACE}" root 2>/dev/null || true
+
+echo "[+] ${IFACE} detached. Pinned programs and maps are still in ${PIN_DIR:-/sys/fs/bpf/vantage}."
+echo "    Run 'sudo ./target/release/vantage-5G unload' to fully remove them."
