@@ -1,798 +1,221 @@
 # Vantage-5G
 
-**Vantage-5G** is a Rust-based manual QoS control and telemetry CLI for service-side bandwidth control in black-box 5G Core environments.
-
-This project assumes that the 5G Core is operated as a separate domain and cannot be modified or directly connected to by the service operator. In such an environment, Vantage-5G provides a way for a network operator to control **service-to-UE bandwidth** from the Kubernetes service domain, without replacing Cilium or directly modifying Cilium-managed BPF maps.
-
-## 1. Motivation
-
-If the 5G Core and service workloads are deployed in the same Kubernetes, Multus, and Cilium networking domain, Cilium's native bandwidth management can be used directly.
-
-However, the target environment for this project is different:
-
-```text
-[UE / Device]
-     |
-[5G Core / Open5GS or similar]   <-- black-box domain
-     |
-[Service Kubernetes Cluster]
-     |
-[Cilium CNI]
-     |
-[Service Pod]
-```
-
-In this environment:
-
-* The 5G Core is not controlled by the service operator.
-* The 5G Core Kubernetes cluster, Multus configuration, CNI, UPF, QFI, and 5QI policy plane are not accessible.
-* Only the service Kubernetes domain is controllable.
-* Cilium owns the Kubernetes service datapath.
-* Vantage-5G does not replace Cilium.
-* Vantage-5G provides an operator-side CLI to adjust bandwidth limits through Cilium-compatible mechanisms.
-
-The initial goal is to validate whether a network operator can manually control the bandwidth of traffic in the following direction:
-
-```text
-[Service Pod] -> [5G Core / UPF path] -> [UE]
-```
-
-## 2. Current Status
-
-Vantage-5G is currently a **manual CLI PoC**.
-
-Implemented commands:
-
-```text
-set
-reset
-monitor
-```
-
-Current capabilities:
-
-* Set Pod egress bandwidth through Kubernetes annotation.
-* Reset Pod egress bandwidth annotation.
-* Load an eBPF object with `libbpf-rs`.
-* Attach an fentry program to observe TCP retransmission events.
-* Read packet telemetry through a BPF ring buffer.
-* Export Prometheus metrics on port `9090`.
-
-Not implemented yet:
-
-* Automatic closed-loop QoS control.
-* UE-aware per-device bandwidth control.
-* Service-name-based bandwidth control.
-* MCP tool integration.
-* AI-agent-based policy decision.
-* Direct update of custom QoS BPF maps from the CLI.
-* Automatic eBPF object compilation from Cargo.
-
-## 3. Architecture
-
-### 3.1 Current PoC Architecture
-
-```text
-+-----------------------------+
-| Network Operator            |
-+--------------+--------------+
-               |
-               | manual CLI
-               v
-+-----------------------------+
-| vantage-5G                  |
-| - set                       |
-| - reset                     |
-| - monitor                   |
-+--------------+--------------+
-               |
-               | Kubernetes API patch
-               v
-+-----------------------------+
-| Kubernetes Pod Annotation   |
-| kubernetes.io/egress-bandwidth
-+--------------+--------------+
-               |
-               | interpreted by
-               v
-+-----------------------------+
-| Cilium Bandwidth Manager    |
-| eBPF / EDT enforcement      |
-+--------------+--------------+
-               |
-               v
-[Service Pod] ---> [5G Core] ---> [UE]
-```
-
-### 3.2 Telemetry Path
-
-```text
-vantage-5G monitor
-    |
-    | loads
-    v
-vantage_ringbuf_edt.o
-    |
-    +--> tc packet telemetry ring buffer
-    |
-    +--> fentry/tcp_retransmit_skb counter
-    |
-    v
-Prometheus metrics endpoint
-http://0.0.0.0:9090/metrics
-```
-
-## 4. Requirements
-
-### 4.1 Recommended Environment
-
-This README assumes a real VM or bare-metal Kubernetes environment.
-
-Do not use Kind for bandwidth enforcement testing. Cilium bandwidth enforcement is not suitable for nested network namespace environments such as Kind.
-
-Recommended environment:
-
-| Component          | Recommended                               |
-| ------------------ | ----------------------------------------- |
-| OS                 | Ubuntu 22.04 or Ubuntu 24.04              |
-| Kernel             | Linux 5.4+                                |
-| Kubernetes         | Existing cluster or kubeadm-based cluster |
-| CNI                | Cilium                                    |
-| Cilium feature     | Bandwidth Manager enabled                 |
-| Rust               | stable toolchain                          |
-| eBPF compiler      | clang/llvm                                |
-| Runtime permission | root required for `monitor`               |
-
-### 4.2 Required Tools
-
-Install the basic build and eBPF dependencies:
-
-```bash
-sudo apt-get update
-
-sudo apt-get install -y \
-  build-essential \
-  clang \
-  llvm \
-  libbpf-dev \
-  libelf-dev \
-  bpftool \
-  linux-tools-common \
-  linux-tools-generic \
-  pkg-config \
-  curl \
-  git \
-  iproute2 \
-  iperf3
-```
-
-Install Rust:
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-
-rustc --version
-cargo --version
-```
-
-Install Kubernetes client tools if they are not already installed:
-
-```bash
-sudo apt-get install -y apt-transport-https ca-certificates gnupg
-```
-
-Install Helm if needed:
-
-```bash
-curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-helm version
-```
-
-Install `kubectl` if needed, following the official Kubernetes documentation for your OS.
-
-Verify Kubernetes access:
-
-```bash
-kubectl get nodes
-kubectl get pods -A
-```
-
-## 5. Cilium Bandwidth Manager
-
-Vantage-5G currently uses Cilium-compatible Pod bandwidth annotations.
-
-Enable Cilium Bandwidth Manager during Cilium installation:
-
-```bash
-helm repo add cilium https://helm.cilium.io/
-helm repo update
-
-helm install cilium cilium/cilium \
-  --namespace kube-system \
-  --version 1.19.5 \
-  --set bandwidthManager.enabled=true
-```
-
-If Cilium is already installed, enable Bandwidth Manager with:
-
-```bash
-helm upgrade cilium cilium/cilium \
-  --namespace kube-system \
-  --version 1.19.5 \
-  --reuse-values \
-  --set bandwidthManager.enabled=true
-
-kubectl -n kube-system rollout restart ds/cilium
-```
-
-Verify Cilium status:
-
-```bash
-kubectl -n kube-system get pods -l k8s-app=cilium
-```
-
-Verify Bandwidth Manager:
-
-```bash
-kubectl -n kube-system exec ds/cilium -- cilium-dbg status | grep BandwidthManager
-```
-
-Expected example:
-
-```text
-BandwidthManager:       EDT with BPF [eth0]
-```
-
-## 6. Clone and Build Vantage-5G
-
-Clone the repository:
-
-```bash
-git clone https://github.com/uni2u/vantage-5G.git
-cd vantage-5G
-```
-
-Check the local build environment:
-
-```bash
-make check
-```
-
-Build both the eBPF object and the Rust CLI:
-
-```bash
-make build
-```
-
-If `make build` fails while reading `/sys/kernel/btf/vmlinux`, run it with sufficient privileges or check BTF availability:
-
-```bash
-ls -lh /sys/kernel/btf/vmlinux
-```
-
-Verify the build artifacts:
-
-```bash
-ls -lh vmlinux.h
-ls -lh vantage_ringbuf_edt.o
-ls -lh target/release/vantage-5G
-```
-
-Verify the binary:
-
-```bash
-./target/release/vantage-5G --help
-```
-
-Expected commands:
-
-```text
-set
-reset
-monitor
-```
-
-The current `monitor` command expects `vantage_ringbuf_edt.o` in the project root. This file is generated by `make build`.
-
-## 7. Deploy the Test Service Pod
-
-Deploy the provided iperf3 server:
-
-```bash
-kubectl apply -f iperf3-deployment.yaml
-```
-
-Check the Pod:
-
-```bash
-kubectl get pods -l app=iperf-server -o wide
-```
-
-Get the Pod name and IP:
-
-```bash
-POD_NAME=$(kubectl get pods -l app=iperf-server -o jsonpath='{.items[0].metadata.name}')
-POD_IP=$(kubectl get pod "$POD_NAME" -o jsonpath='{.status.podIP}')
-
-echo "POD_NAME=$POD_NAME"
-echo "POD_IP=$POD_IP"
-```
-
-## 8. Run Vantage Monitor
-
-The monitor command requires root privileges.
-
-Run it in terminal 1:
-
-```bash
-sudo ./target/release/vantage-5G monitor
-```
-
-The monitor command performs the following actions:
-
-* Starts a Prometheus exporter on port `9090`.
-* Loads `vantage_ringbuf_edt.o`.
-* Pins BPF maps under `/sys/fs/bpf`.
-* Attaches `fentry/tcp_retransmit_skb`.
-* Polls the BPF ring buffer.
-* Exports packet and TCP retransmission metrics.
-
-Verify the metrics endpoint from another terminal:
-
-```bash
-curl http://127.0.0.1:9090/metrics | grep vantage
-```
-
-Expected metric names:
-
-```text
-vantage_tenant_tx_bytes_total
-vantage_tenant_tx_packets_total
-vantage_node_tcp_retransmit_total
-```
-
-If accessing from another machine:
-
-```bash
-curl http://<NODE_IP>:9090/metrics | grep vantage
-```
-
-## 9. Attach the Packet Sniffer to the Pod Interface
-
-Run the helper script in terminal 2:
-
-```bash
-chmod +x ready.sh
-./ready.sh
-```
-
-The script performs the following:
-
-* Finds the `iperf-server` Pod.
-* Reads the Pod-side `eth0` iflink.
-* Resolves the host-side veth or lxc interface.
-* Adds a `clsact` qdisc.
-* Attaches the pinned `vantage_telemetry_sniffer` program to ingress and egress.
-* Starts an iperf3 server loop inside the Pod.
-
-Check that the tc filter is attached:
-
-```bash
-tc qdisc show
-tc filter show dev <TARGET_DEV> ingress
-tc filter show dev <TARGET_DEV> egress
-```
-
-Replace `<TARGET_DEV>` with the interface printed by `ready.sh`.
-
-## 10. Test Baseline Throughput
-
-From a client that can reach the service Pod IP, run:
-
-```bash
-iperf3 -c "$POD_IP" -R
-```
-
-The `-R` option means reverse mode. The remote iperf3 server sends traffic back to the client.
-
-This is the important direction for this project:
-
-```text
-Service Pod -> Client / UE
-```
-
-While traffic is running, check the Vantage monitor terminal.
-
-You should see telemetry logs similar to:
-
-```text
-[TELEMETRY] Pod IP: ... | size: ... Bytes | metric updated
-```
-
-Also verify Prometheus metrics:
-
-```bash
-curl http://127.0.0.1:9090/metrics | grep vantage_tenant_tx
-```
-
-## 11. Set Bandwidth Limit
-
-Use the `set` command to apply an egress bandwidth limit to the service Pod.
-
-Example: limit the service Pod egress bandwidth to 100 Mbps.
-
-```bash
-./target/release/vantage-5G set \
-  --pod "$POD_NAME" \
-  --namespace default \
-  --bw-mbps 100
-```
-
-Short option form:
-
-```bash
-./target/release/vantage-5G set -p "$POD_NAME" -n default -b 100
-```
-
-Verify the annotation:
-
-```bash
-kubectl get pod "$POD_NAME" -o jsonpath='{.metadata.annotations.kubernetes\.io/egress-bandwidth}'
-echo
-```
-
-Expected output:
-
-```text
-100M
-```
-
-Run iperf3 again:
-
-```bash
-iperf3 -c "$POD_IP" -R
-```
-
-The measured throughput should be close to the configured bandwidth limit, depending on kernel, Cilium configuration, routing mode, node device, and test path.
-
-## 12. Reset Bandwidth Limit
-
-Remove the bandwidth annotation:
-
-```bash
-./target/release/vantage-5G reset \
-  --pod "$POD_NAME" \
-  --namespace default
-```
-
-Short option form:
-
-```bash
-./target/release/vantage-5G reset -p "$POD_NAME" -n default
-```
-
-Verify that the annotation is removed:
-
-```bash
-kubectl get pod "$POD_NAME" -o jsonpath='{.metadata.annotations.kubernetes\.io/egress-bandwidth}'
-echo
-```
-
-Run iperf3 again:
-
-```bash
-iperf3 -c "$POD_IP" -R
-```
-
-The throughput should no longer be constrained by the previously configured Vantage-5G bandwidth limit.
-
-## 13. Prometheus Integration
-
-Vantage-5G exposes metrics on:
-
-```text
-http://<NODE_IP>:9090/metrics
-```
-
-Example Prometheus scrape configuration:
-
-```yaml
-scrape_configs:
-  - job_name: "vantage-5g"
-    scrape_interval: 1s
-    static_configs:
-      - targets:
-          - "<NODE_IP>:9090"
-```
-
-Useful PromQL queries:
-
-Throughput in Mbps:
-
-```promql
-rate(vantage_tenant_tx_bytes_total[5s]) * 8 / 1000000
-```
-
-Packets per second:
-
-```promql
-rate(vantage_tenant_tx_packets_total[5s])
-```
-
-TCP retransmission increase over 30 seconds:
-
-```promql
-increase(vantage_node_tcp_retransmit_total[30s])
-```
-
-Scrape health:
-
-```promql
-up{job="vantage-5g"}
-```
-
-Grafana should be connected after Prometheus scraping and PromQL validation are confirmed.
-
-## 14. CLI Reference
-
-### 14.1 `set`
-
-Set egress bandwidth for a Pod.
-
-```bash
-./target/release/vantage-5G set \
-  --pod <POD_NAME> \
-  --namespace <NAMESPACE> \
-  --bw-mbps <LIMIT_MBPS>
-```
-
-Example:
-
-```bash
-./target/release/vantage-5G set \
-  --pod iperf-server-xxxxx \
-  --namespace default \
-  --bw-mbps 100
-```
-
-This patches the following Pod annotation:
-
-```text
-kubernetes.io/egress-bandwidth: "100M"
-```
-
-### 14.2 `reset`
-
-Remove egress bandwidth control from a Pod.
-
-```bash
-./target/release/vantage-5G reset \
-  --pod <POD_NAME> \
-  --namespace <NAMESPACE>
-```
-
-Example:
-
-```bash
-./target/release/vantage-5G reset \
-  --pod iperf-server-xxxxx \
-  --namespace default
-```
-
-### 14.3 `monitor`
-
-Start the eBPF telemetry and Prometheus exporter.
-
-```bash
-sudo ./target/release/vantage-5G monitor
-```
-
-The command expects:
-
-```text
-vantage_ringbuf_edt.o
-```
-
-to exist in the project root.
-
-## 15. Troubleshooting
-
-### 15.1 `vantage_ringbuf_edt.o` not found
-
-Build the eBPF object and Rust CLI:
-
-```bash
-make build
-```
-
-Verify the object file:
-
-```bash
-ls -lh vantage_ringbuf_edt.o
-```
-
-If `make build` fails, check required tools:
-
-```bash
-make check
-```
-
-### 15.2 `K8s connection failed`
-
-Check kubeconfig:
-
-```bash
-kubectl get nodes
-echo "$KUBECONFIG"
-```
-
-If needed:
-
-```bash
-export KUBECONFIG=/etc/kubernetes/admin.conf
-```
-
-### 15.3 Bandwidth limit does not apply
-
-Check Cilium Bandwidth Manager:
-
-```bash
-kubectl -n kube-system exec ds/cilium -- cilium-dbg status | grep BandwidthManager
-```
-
-Check the Pod annotation:
-
-```bash
-kubectl get pod "$POD_NAME" -o yaml | grep -A5 annotations
-```
-
-Check Cilium bandwidth state:
-
-```bash
-kubectl -n kube-system exec ds/cilium -- cilium-dbg bpf bandwidth list
-```
-
-### 15.4 `ready.sh` cannot find the Pod
-
-Check that the iperf3 Pod exists:
-
-```bash
-kubectl get pods -l app=iperf-server -o wide
-```
-
-If no Pod exists:
-
-```bash
-kubectl apply -f iperf3-deployment.yaml
-```
-
-### 15.5 No telemetry events
-
-Check that `monitor` is running:
-
-```bash
-curl http://127.0.0.1:9090/metrics | grep vantage
-```
-
-Check that `ready.sh` attached the tc filter to the correct interface.
-
-```bash
-tc qdisc show
-```
-
-Check BPF pin paths:
-
-```bash
-sudo ls -l /sys/fs/bpf/vantage
-sudo ls -l /sys/fs/bpf/tc/globals
-```
-
-### 15.6 Permission denied
-
-Run monitor with root privileges:
-
-```bash
-sudo ./target/release/vantage-5G monitor
-```
-
-## 16. Known Limitations
-
-Current limitations:
-
-* Bandwidth control is Pod-based, not UE-based.
-* `set/reset` currently use Kubernetes Pod annotations.
-* The CLI does not directly update custom eBPF bandwidth maps.
-* The CLI does not yet support service-level abstraction.
-* The CLI does not yet support automatic policy decisions.
-* The eBPF object is built through `make build`, but Cargo does not yet build it automatically.
-* `ready.sh` is a PoC helper script and assumes an `iperf-server` Pod.
-* Cilium remains the datapath authority.
-* Vantage-5G should not directly compete with or replace Cilium.
-* Direct manipulation of Cilium-managed BPF maps is treated as experimental and should not be used as the stable control path.
-
-## 17. Design Notes
-
-Vantage-5G is intentionally designed as a Cilium-compatible auxiliary tool.
-
-The stable control path is:
-
-```text
-Vantage CLI
-  -> Kubernetes API
-  -> Pod annotation
-  -> Cilium Bandwidth Manager
-  -> eBPF / EDT enforcement
-```
-
-The experimental control path is:
-
-```text
-Vantage CLI
-  -> custom eBPF map
-  -> custom TC/EDT program
-```
-
-The experimental path is not the default because Cilium owns the Kubernetes datapath, BPF map lifecycle, endpoint identity, and datapath reconciliation.
+Per-UE **RX/TX bandwidth control** for services sitting behind a black-box 5G Core (특화망 / private 5G).
+Enforcement runs at the **service node**, via **XDP (RX policer)** and **tc-bpf + EDT (TX pacer)**.
+Policy is set **manually by an administrator** through a small Rust CLI writing directly into BPF maps.
+Metrics are exported to Prometheus for a dashboard.
 
 ---
 
-## Future Work
+## 1. What this is
 
-Planned directions:
+- The 5G Core (UPF+gNB) enforces radio-side QoS as 3GPP prescribes, but in private-5G deployments the downlink QER is usually only coarse aggregate. Vantage adds an **application-aware per-UE shaping layer at the service node**, upstream of the UPF, so DL is actually well-behaved and the service also has an autonomous RX policy point.
+- The controlled path is:
 
-* Service-level QoS command:
-
-```bash
-vantage-5G set-service \
-  --service video \
-  --namespace default \
-  --bw-mbps 20
+```
+[UE] -- radio -- [gNB] -- N3 -- [5G Core / UPF (black-box)] -- N6 --> [service node N6 NIC] --> [service app]
+                                                                              ▲
+                                                                              │
+                                                             Vantage attaches here.
+                                                             XDP on ingress = UL (RX).
+                                                             tc-bpf on egress = DL (TX).
 ```
 
-* UE-aware QoS policy model:
+- Development testbed = **UE emulator + UERANSIM (gNB) + Open5GS (core)**. Target production = a real private-5G core; Vantage never talks to the 5G core, so swapping the testbed for a real core is a re-run of `setup.sh`, not a rewrite.
+
+## 2. Scope (Phase 1, current)
+
+- Identification key: **UE IPv4 address** (as seen on N6).
+- Policy: `{rx_bps, tx_bps}` per UE. `tx_bps = 0` is an explicit downlink **killswitch**.
+- No automation, no policy engine. An admin runs `vantage-5G set …` when they want to change something.
+- Enforcement: XDP token-bucket on ingress; tc-bpf EDT pacing on egress (relies on `fq` root qdisc).
+- Metrics: per-UE RX/TX bytes, packets, drops via Prometheus on port 9090.
+
+Phase 2 (later) will extend the policy key to a 5-tuple LPM_TRIE for micro-segmentation. Not yet in this build.
+
+## 3. Requirements
+
+| Component | Minimum |
+|---|---|
+| OS | Ubuntu 22.04 / 24.04 |
+| Kernel | Linux 5.15+ (BTF at `/sys/kernel/btf/vmlinux`) |
+| Tools | `clang`, `llvm`, `bpftool`, `iproute2` (`tc`, `ip`), `libbpf-dev`, `libelf-dev` |
+| Toolchain | Rust stable (`rustup`) |
+| NIC | XDP-capable driver preferred; `xdpgeneric` used by default so any NIC works. |
+| Privilege | `root` for `load`, `monitor`, `setup.sh`, `detach.sh`. `set`/`reset`/`list`/`stats` only need read/write on the BPFFS pins. |
 
 ```bash
-vantage-5G apply-policy \
-  --ue-ip 10.45.1.23 \
-  --service video \
-  --profile premium
+sudo apt-get install -y build-essential clang llvm libbpf-dev libelf-dev bpftool \
+    linux-tools-common linux-tools-generic pkg-config iproute2 iperf3
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-* Prometheus-based QoS validation.
-* Grafana dashboard.
-* MCP tool/resource integration.
-* Semantic metric aggregation.
-* AI-agent-based closed-loop QoS control.
-* Cargo-integrated eBPF build pipeline, such as `build.rs` or `libbpf-cargo`.
-* Safer and more robust interface attachment logic.
-
-## Cleanup
-
-Remove the test deployment:
+## 4. Build
 
 ```bash
-kubectl delete -f iperf3-deployment.yaml
+git clone https://github.com/uni2u/vantage-5g.git
+cd vantage-5g
+
+make check      # verifies clang / bpftool / tc / ip / BTF
+make build      # produces vantage_rx_policer.o, vantage_tx_pacer.o, target/release/vantage-5G
 ```
 
-Remove tc qdisc from the target interface if needed:
+Artifacts:
+
+```
+vantage_rx_policer.o      # XDP RX policer (per-UE token bucket)
+vantage_tx_pacer.o        # tc-bpf egress + EDT (per-UE pacer, killswitch)
+target/release/vantage-5G # Rust CLI
+```
+
+## 5. Bootstrap — one-time load and attach
+
+Do these in order on the **service node**.
 
 ```bash
-sudo tc qdisc del dev <TARGET_DEV> clsact
+# 1) Load & pin BPF programs and maps into /sys/fs/bpf/vantage/.
+sudo ./target/release/vantage-5G load
+
+# 2) Attach the pinned programs to your N6-facing NIC.
+#    Replace enp0s3 with whatever interface faces the 5G Core (N6).
+sudo ./setup.sh enp0s3
 ```
 
-Remove pinned BPF objects if needed:
+What `setup.sh` does:
+
+1. `tc qdisc replace dev <iface> root fq` — required for `skb->tstamp` pacing.
+2. `tc qdisc add dev <iface> clsact` — hook point for the tc-bpf egress filter.
+3. `ip link set dev <iface> xdpgeneric pinned /sys/fs/bpf/vantage/vantage_rx_policer`
+4. `tc filter add dev <iface> egress bpf da pinned /sys/fs/bpf/vantage/vantage_tx_pacer`
+
+## 6. Set / reset / inspect per-UE policy
 
 ```bash
-sudo rm -rf /sys/fs/bpf/vantage
-sudo rm -f /sys/fs/bpf/tc/globals/telemetry_rb
-sudo rm -f /sys/fs/bpf/tc/globals/tcp_retransmit_counter
+# Set: UE at 10.45.1.23 gets 10 Mbps uplink admit, 20 Mbps downlink pace.
+./target/release/vantage-5G set --ue-ip 10.45.1.23 --rx-mbps 10 --tx-mbps 20
+
+# Killswitch: block downlink to this UE entirely (uplink still policed at 10 Mbps).
+./target/release/vantage-5G set --ue-ip 10.45.1.23 --rx-mbps 10 --tx-mbps 0
+
+# Clear all shaping for a UE (traffic bypasses shaping).
+./target/release/vantage-5G reset --ue-ip 10.45.1.23
+
+# Dump every UE with a policy.
+./target/release/vantage-5G list
+
+# Dump per-UE counters (all UEs, or filtered).
+./target/release/vantage-5G stats
+./target/release/vantage-5G stats --ue-ip 10.45.1.23
 ```
 
-## Project Summary
+## 7. Monitor — Prometheus exporter
 
-Vantage-5G is a manual Rust CLI PoC for service-side QoS control in black-box 5G Core environments.
+```bash
+sudo ./target/release/vantage-5G monitor           # binds :9090
+# or a different port:
+sudo ./target/release/vantage-5G monitor --port 9191
+```
 
-It does not replace Cilium.
+Exposed series (all labeled with `ue_ip`):
 
-It uses Cilium-compatible bandwidth control as the stable path and provides eBPF telemetry for future closed-loop QoS automation.
+```
+vantage_ue_rx_bytes_total       # bytes admitted by the RX policer
+vantage_ue_rx_packets_total
+vantage_ue_rx_drops_total       # dropped by the RX policer
+vantage_ue_tx_bytes_total       # bytes paced by the TX pacer
+vantage_ue_tx_packets_total
+vantage_ue_tx_drops_total       # dropped by the killswitch
+vantage_ue_policy_rx_bps        # configured RX cap
+vantage_ue_policy_tx_bps        # configured TX cap (0 = killswitch)
+```
+
+Useful PromQL:
+
+```promql
+# realized RX throughput per UE, Mbps
+rate(vantage_ue_rx_bytes_total[5s]) * 8 / 1e6
+
+# realized TX throughput per UE, Mbps
+rate(vantage_ue_tx_bytes_total[5s]) * 8 / 1e6
+
+# RX drops per second — sign that the UE is bumping into its cap
+rate(vantage_ue_rx_drops_total[10s])
+```
+
+A Grafana dashboard will land in `dashboards/` once the test bed is producing traffic; the exporter is stable and unlikely to change further.
+
+## 8. Verification — Phase 1 completion criteria
+
+Phase 1 is considered done when **two UEs**, each with distinct RX/TX limits, hold their configured rates **simultaneously in both directions**. Concretely, four concurrent `iperf3` sessions.
+
+Assumption: two UEs registered through UERANSIM, IPs `10.45.1.23` (UE-A) and `10.45.1.24` (UE-B); service reachable at `SVC`.
+
+```bash
+# On the service node — set the policies.
+./target/release/vantage-5G set --ue-ip 10.45.1.23 --rx-mbps 10 --tx-mbps 20
+./target/release/vantage-5G set --ue-ip 10.45.1.24 --rx-mbps  3 --tx-mbps  5
+
+# On the service node — one iperf3 server per direction per UE.
+iperf3 -s -p 5201 &   # UE-A uplink
+iperf3 -s -p 5202 &   # UE-B uplink
+iperf3 -s -p 5203 &   # UE-A downlink (client uses -R)
+iperf3 -s -p 5204 &   # UE-B downlink (client uses -R)
+
+# On UE-A (10.45.1.23):
+iperf3 -c $SVC -p 5201 -t 30       # UL — expect ~10 Mbps
+iperf3 -c $SVC -p 5203 -t 30 -R    # DL — expect ~20 Mbps
+
+# On UE-B (10.45.1.24):
+iperf3 -c $SVC -p 5202 -t 30       # UL — expect ~3 Mbps
+iperf3 -c $SVC -p 5204 -t 30 -R    # DL — expect ~5 Mbps
+```
+
+Run the four client sessions **concurrently**. Pass criterion: each session settles within ±10% of its configured cap, and UE-A's traffic does not visibly disturb UE-B's rate (or vice versa).
+
+You can watch the counters live during the test:
+
+```bash
+watch -n1 './target/release/vantage-5G stats'
+```
+
+## 9. Detach & unload
+
+```bash
+sudo ./detach.sh enp0s3                        # remove tc filter, XDP, clsact, root fq
+sudo ./target/release/vantage-5G unload         # remove pinned programs & maps
+```
+
+## 10. Troubleshooting
+
+**`skb->tstamp` seems to be ignored (TX pacing has no effect)** — the interface's root qdisc is not `fq`. `setup.sh` sets it, but if you attach manually make sure `tc qdisc show dev <iface>` prints `qdisc fq …` at root.
+
+**`open ue_policy_map (run 'vantage-5G load' first)`** — the CLI can't find the pinned map. Run `sudo ./target/release/vantage-5G load` once per boot.
+
+**`ip link set … xdpgeneric` succeeds but nothing hits XDP** — the interface may be a virtual link Chromium of the wrong kind. Try attaching to the physical N6 NIC directly (not a bridge or VF representor).
+
+**RX drop counter climbs but throughput isn't shaped** — the traffic isn't going through the interface you attached to. `sudo ip -s link show dev <iface>` should show packet counts moving; `./target/release/vantage-5G stats` should show the same UE's rx_bytes rising.
+
+**Verifier rejects the program after `make build`** — usually a kernel/BTF mismatch. `make check` verifies BTF; if you upgraded the kernel, re-run `make clean && make build` so `vmlinux.h` is regenerated for the running kernel.
+
+**BPF map still populated after `unload`** — the `unload` command removes pins but the kernel keeps the objects alive as long as *something* references them (an attached filter, a pinned link). Run `detach.sh` first.
+
+## 11. Files
+
+| Path | Role |
+|---|---|
+| `vantage_rx_policer.c` | XDP program: per-UE token-bucket RX policer. |
+| `vantage_tx_pacer.c`   | tc-bpf egress program: per-UE EDT TX pacer + killswitch. |
+| `src/main.rs`          | Rust CLI: `load`, `unload`, `set`, `reset`, `list`, `stats`, `monitor`. |
+| `Cargo.toml`           | Rust deps: `libbpf-rs`, `libbpf-sys`, `prometheus_exporter`, `clap`, `anyhow`. |
+| `Makefile`             | `make check / build / clean`. |
+| `setup.sh`             | Attach pinned programs to a NIC, set `fq` root qdisc. |
+| `detach.sh`            | Undo `setup.sh`. |
+| `iperf3-deployment.yaml` | Test workload (used when the service happens to run inside K8s). |
+| `install_k8s_singlenode.md` | Optional single-node K8s setup notes (only if you run the service in K8s). |
+| `history.md`           | Historical design log. Not required for build or operation. |
+
+## 12. Roadmap
+
+- Phase 2: replace `ue_policy_map` with an `LPM_TRIE` keyed on `(ue_ip, svc_ip, port, proto)` for micro-segmentation, longest-match semantics.
+- Grafana dashboard JSON under `dashboards/`.
+- Optional systemd unit for `load` at boot.
