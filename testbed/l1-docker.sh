@@ -16,6 +16,8 @@ OUT=${ROOT}/_workspace/l1-${TS}
 mkdir -p "${OUT}"
 
 docker build -q -t vantage-dev:latest testbed/docker >/dev/null || exit 1
+# Tested tree: HEAD plus "-dirty" when tracked files have uncommitted changes.
+git -C "${ROOT}" describe --always --dirty > "${OUT}/commit.txt" 2>/dev/null || echo no-git > "${OUT}/commit.txt"
 
 # Named volumes cache cargo registry and build output between runs.
 docker run --rm --privileged \
@@ -26,7 +28,6 @@ docker run --rm --privileged \
     -e OUT=/results -e T="${T:-15}" \
     vantage-dev:latest bash -c '
         tar -C /src --exclude=./target --exclude=./_workspace* --exclude=./.git -cf - . | tar -C /work -xf -
-        git -C /src rev-parse --short HEAD > /results/commit.txt 2>/dev/null || true
         cd /work && bash testbed/run-tests.sh'
 rc=$?
 echo "L1 results: ${OUT}"

@@ -81,7 +81,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-{ uname -r; git -C "${ROOT}" rev-parse --short HEAD 2>/dev/null || echo "no-git"
+{ uname -r; git -C "${ROOT}" describe --always --dirty 2>/dev/null || echo "no-git"
   . /etc/os-release 2>/dev/null && echo "os=${PRETTY_NAME:-?}"
   echo "iproute2=$(ip -V 2>&1)"; echo "bpftool=${BPFTOOL:-none}"
   echo "setup_as=${SETUP_AS:-root} no_bpftool=${VT_NO_BPFTOOL:-0}"; } > "${OUT}/env.txt"
