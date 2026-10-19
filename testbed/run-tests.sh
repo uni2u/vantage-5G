@@ -18,12 +18,25 @@
 #                           requires bpftool (exit 2, nothing changed, when it is
 #                           missing) and the setup.sh-no-bpftool step checks that
 #                           on every run. The test itself keeps using the real binary.
+#      VT_XDP_MODE=generic|native  XDP mode requested from setup.sh (default generic).
+#                           Unset: setup.sh is called without --xdp-mode (operator
+#                           default path); set: every setup.sh call passes
+#                           --xdp-mode <mode>. Also selects xdpgeneric/xdpdrv for the
+#                           L1 manual attach.
+#      VT_N6_TXQ=<n>        TX queues of the N6 veth (netns-topo.sh, default 1).
+#                           n>=2: setup.sh must build root mq + one fq per TX queue.
+#      VT_N6_TXQ_MAX=<m>    allocated queues (default n); m>=4>n enables setup.sh-txq-grow.
 #
 # Regression steps (3rd round): D4 forwarded-UDP overload -> TCP still connects,
 # D6 rx 1 Mbps + small-packet flood, D7 set/reset clear rx/tx state, D14 unload
 # refused while attached, P-M1 detach.sh exit 4/1, D19 upgrade from HASH pins.
 # 4th round: D25 LRU max_entries 16384 (map-sizes-d25, upgrade from LRU-1024
 # pins), D26 same-value set keeps rx/tx state, changed value clears it.
+# 6th round (setup.sh --xdp-mode, mq): attached_ok checks the requested XDP slot
+# and root fq (1 TX queue) or root mq + fq on every TX queue; setup.sh-rerun-no-gap
+# (tc/ip monitor: no qdisc/filter deletion, no XDP-less link event), setup.sh-mq-repair
+# (n>=2: root fq / non-fq child converted), xdp-mode-switch (other mode and back,
+# flag order, invalid value), dl-multiflow-ue-cap (-P 4 DL, per-UE counter cap).
 
 set -u
 cd "$(dirname "$0")/.."
@@ -37,6 +50,14 @@ VERDICT=${ROOT}/.claude/skills/vantage-testbed/scripts/iperf_verdict.py
 CVERDICT=${ROOT}/.claude/skills/vantage-testbed/scripts/counter_verdict.py
 SETUP_AS=${VT_SETUP_AS:-}
 NONROOT_USER=${VT_NONROOT_USER:-ubuntu}
+UA=10.45.1.23
+XDP_MODE=${VT_XDP_MODE:-generic}
+# Kernel XDP slot per setup.sh mode (iproute2 names, also used by `ip link set`).
+slot_of() { case "$1" in generic) echo xdpgeneric ;; native) echo xdpdrv ;; *) return 1 ;; esac; }
+XDP_SLOT=$(slot_of "${XDP_MODE}") || { echo "VT_XDP_MODE must be generic or native (got '${XDP_MODE}')"; exit 1; }
+# Unset VT_XDP_MODE = operator default path (no flag); set = explicit flag on every call.
+SETUP_ARGS=()
+[[ -n "${VT_XDP_MODE:-}" ]] && SETUP_ARGS=(--xdp-mode "${XDP_MODE}")
 # Real bpftool binary for the test's own checks (/usr/local/lib/vantage-testbed/bpftool:
 # a private copy kept when linux-tools-$(uname -r) is removed to mimic a bare 22.04) (Ubuntu's /usr/sbin/bpftool is a
 # wrapper that needs linux-tools-$(uname -r); prefer the matching real binary).
@@ -52,6 +73,8 @@ SUMMARY=${OUT}/summary.txt
 # setup.sh/detach.sh as the operator would run them (root, or VT_SETUP_AS user).
 op() { if [[ -n "${SETUP_AS}" ]]; then sudo -n -u "${SETUP_AS}" -H -- "$@"; else "$@"; fi; }
 as_user() { local u=$1; shift; sudo -n -u "${u}" -H -- "$@"; }
+# setup.sh <iface> [--xdp-mode <VT_XDP_MODE>] [extra args], as the operator.
+setup_op() { op "${ROOT}/setup.sh" "${IF}" ${SETUP_ARGS[@]+"${SETUP_ARGS[@]}"} "$@"; }
 hide_bpftool() {
     local f
     for f in /usr/sbin/bpftool /usr/local/sbin/bpftool /usr/bin/bpftool /usr/local/bin/bpftool; do
@@ -73,6 +96,7 @@ cleanup() {
     # detach -> unload: unload refuses while a Vantage program is attached (D14).
     op "${ROOT}/detach.sh" "${IF}" >/dev/null 2>&1 || true
     ip link set dev "${IF}" xdpgeneric off 2>/dev/null || true
+    ip link set dev "${IF}" xdpdrv off 2>/dev/null || true
     tc qdisc del dev "${IF}" clsact 2>/dev/null || true
     pkill -x iperf3 2>/dev/null || true
     ip netns del vt-src 2>/dev/null || true; ip link del vt-s0 2>/dev/null || true
@@ -84,24 +108,66 @@ trap cleanup EXIT
 { uname -r; git -C "${ROOT}" describe --always --dirty 2>/dev/null || echo "no-git"
   . /etc/os-release 2>/dev/null && echo "os=${PRETTY_NAME:-?}"
   echo "iproute2=$(ip -V 2>&1)"; echo "bpftool=${BPFTOOL:-none}"
-  echo "setup_as=${SETUP_AS:-root} no_bpftool=${VT_NO_BPFTOOL:-0}"; } > "${OUT}/env.txt"
+  echo "setup_as=${SETUP_AS:-root} no_bpftool=${VT_NO_BPFTOOL:-0}"
+  echo "xdp_mode=${XDP_MODE} (setup.sh args: ${SETUP_ARGS[*]:-none}) n6_txq=${VT_N6_TXQ:-1}"; } > "${OUT}/env.txt"
 mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf
 
-# Expected attach state after setup.sh (see setup.sh step 5): generic XDP running
-# the pinned policer, root fq, clsact, exactly one Vantage egress filter at
-# pref 1 handle 0x1 direct-action running the pinned pacer.
+# Expected attach state after setup.sh (see setup.sh step 5, contract round 6):
+#   - XDP: only the requested slot (xdpgeneric | xdpdrv) is used, running the
+#     pinned policer (id-based: iproute2 5.15 prints no prog names);
+#   - qdisc: 1 TX queue -> root fq; n>=2 -> root mq and an fq child on every
+#     TX queue (parent <mq handle>:<queue+1, hex>);
+#   - clsact, exactly one Vantage egress filter at pref 1 handle 0x1
+#     direct-action running the pinned pacer.
 pin_id() { "${BPFTOOL:-bpftool}" prog show pinned "$1" 2>/dev/null | sed -n '1s/^\([0-9]*\):.*/\1/p'; }
 attach_snapshot() {
     ip -d link show dev "${IF}"; tc qdisc show dev "${IF}"; tc filter show dev "${IF}" egress
 }
+txq_count() { ls -d /sys/class/net/"${IF}"/queues/tx-* 2>/dev/null | wc -l | tr -d ' '; }
+# One line "<slot> <prog id>" per attached XDP program (empty when none), from
+# `ip -j -d link`: works for single and multi attachment and on iproute2 5.15.
+xdp_slots() {
+    ip -j -d link show dev "${IF}" | python3 -c '
+import json, sys
+x = json.load(sys.stdin)[0].get("xdp")
+if x:
+    names = {1: "xdpdrv", 2: "xdpgeneric", 3: "xdpoffload"}
+    for a in (x.get("attached") or [x]):
+        print(names.get(a.get("mode"), "mode%s" % a.get("mode")), a.get("prog", {}).get("id", "?"))'
+}
+# $1 = expected slot (default: the VT_XDP_MODE slot).
+xdp_ok() {
+    local want=${1:-${XDP_SLOT}} xid slots
+    xid=$(pin_id /sys/fs/bpf/vantage/vantage_rx_policer); slots=$(xdp_slots)
+    [[ "${slots}" == "${want} ${xid:-X}" ]] && { echo "XDP: ${slots}"; return 0; }
+    echo "XDP attachments '${slots//$'\n'/; }' != '${want} ${xid}' (requested slot only, pinned policer id)"
+    return 1
+}
+qdisc_ok() {
+    local nq q h i par rc=0
+    nq=$(txq_count); q=$(tc qdisc show dev "${IF}")
+    if [[ ${nq} -le 1 ]]; then
+        echo "${q}" | grep -q '^qdisc fq [0-9a-f]*: root' || { echo "root qdisc is not fq (1 TX queue)"; return 1; }
+        return 0
+    fi
+    h=$(echo "${q}" | sed -n 's/^qdisc mq \([0-9a-f]*\): root.*/\1/p')
+    [[ -n "${h}" ]] || { echo "root qdisc is not mq (${nq} TX queues)"; return 1; }
+    # tc prints the kernel default mq's (handle 0:) classes as ":<q>".
+    [[ "${h}" == 0 ]] && h=""
+    for (( i = 1; i <= nq; i++ )); do
+        par="${h}:$(printf %x "${i}")"
+        echo "${q}" | grep -qE "^qdisc fq [0-9a-f]+: parent ${par}( |\$)" \
+            || { echo "TX queue $(( i - 1 )) (parent ${par}): no fq child"; rc=1; }
+    done
+    return ${rc}
+}
+# $1 = expected XDP slot (default: the VT_XDP_MODE slot).
 attached_ok() {
-    local err=0 xid tid link filt ours n
-    xid=$(pin_id /sys/fs/bpf/vantage/vantage_rx_policer); tid=$(pin_id /sys/fs/bpf/vantage/vantage_tx_pacer)
-    link=$(ip -d link show dev "${IF}"); filt=$(tc filter show dev "${IF}" egress)
-    echo "${link}" | head -1 | grep -q ' xdpgeneric' || { echo "XDP not in generic mode"; err=1; }
-    # id-based: iproute2 5.15 (Ubuntu 22.04) prints no prog names.
-    echo "${link}" | grep -qE "prog/xdp id ${xid:-X}( |\$)" || { echo "XDP prog != pinned policer id ${xid}"; err=1; }
-    tc qdisc show dev "${IF}" | grep -q '^qdisc fq [0-9a-f]*: root' || { echo "root qdisc is not fq"; err=1; }
+    local err=0 tid filt ours n
+    tid=$(pin_id /sys/fs/bpf/vantage/vantage_tx_pacer)
+    filt=$(tc filter show dev "${IF}" egress)
+    xdp_ok "${1:-}" || err=1
+    qdisc_ok || err=1
     tc qdisc show dev "${IF}" | grep -q '^qdisc clsact ' || { echo "clsact missing"; err=1; }
     ours=$(echo "${filt}" | grep -E "( id ${tid:-X}( |\$)|name vantage_tx_pace |vantage_tx_pacer:\[)" || true)
     n=$(echo -n "${ours}" | grep -c . || true)
@@ -122,12 +188,12 @@ ipkey() { echo "$1" | tr . ' '; }
 has_state() { "${BPFTOOL}" map lookup pinned "/sys/fs/bpf/vantage/$1" key $(ipkey "$2") >/dev/null 2>&1; }
 # Attach the loaded programs: setup.sh where fq exists, otherwise the L1 manual path.
 attach() {
-    if [[ ${HAS_FQ} == 1 ]]; then op "${ROOT}/setup.sh" "${IF}" && attached_ok
+    if [[ ${HAS_FQ} == 1 ]]; then setup_op && attached_ok
     else manual_attach; fi
 }
 manual_attach() {
     tc qdisc replace dev "${IF}" clsact &&
-    ip link set dev "${IF}" xdpgeneric pinned /sys/fs/bpf/vantage/vantage_rx_policer &&
+    ip link set dev "${IF}" "${XDP_SLOT}" pinned /sys/fs/bpf/vantage/vantage_rx_policer &&
     tc filter add dev "${IF}" egress bpf da pinned /sys/fs/bpf/vantage/vantage_tx_pacer
 }
 is_attached_any() { ip -d link show dev "${IF}" | grep -q 'prog/xdp' || tc filter show dev "${IF}" egress | grep -q bpf; }
@@ -136,12 +202,200 @@ no_bpftool_refused() {
     local before after rc
     hide_bpftool || { echo "could not hide bpftool"; restore_bpftool; return 1; }
     before=$(attach_snapshot 2>&1)
-    op "${ROOT}/setup.sh" "${IF}"; rc=$?
+    setup_op; rc=$?
     after=$(attach_snapshot 2>&1)
     restore_bpftool
     echo "setup.sh rc=${rc} (expect 2)"
     [[ ${rc} == 2 ]] || return 1
     [[ "${before}" == "${after}" ]] || { echo "state changed:"; diff <(echo "${before}") <(echo "${after}"); return 1; }
+}
+
+# Qdisc kind/handle/parent, XDP slots and egress filter ids: equal before and
+# after a re-run that must not rebuild anything.
+hook_ids() {
+    tc qdisc show dev "${IF}" | awk '/^qdisc/ {print $2, $3, $4, $5}'
+    xdp_slots
+    tc filter show dev "${IF}" egress | grep -oE ' id [0-9]+' | tr -d '\n'; echo
+}
+monitor_start() {  # $1 = file prefix; sets MON_PIDS
+    local lb=(); command -v stdbuf >/dev/null && lb=(stdbuf -oL)
+    ${lb[@]+"${lb[@]}"} tc monitor > "$1.tc" 2>&1 & MON_PIDS="$!"
+    ${lb[@]+"${lb[@]}"} ip monitor link > "$1.link" 2>&1 & MON_PIDS+=" $!"
+    sleep 0.5
+}
+monitor_stop() { sleep 0.5; kill ${MON_PIDS} 2>/dev/null; wait ${MON_PIDS} 2>/dev/null; MON_PIDS=""; }
+# Gaps seen by the monitors in $1.*: a deleted qdisc/filter on IF, or a link
+# event for IF that shows no XDP program (= XDP removed, even if re-added).
+monitor_gaps() {
+    local rc=0 del nox
+    del=$(grep -E '^deleted ' "$1.tc" | grep -E "dev ${IF}( |\$)" || true)
+    nox=$(grep -E "^[0-9]+: ${IF}[@:]" "$1.link" | grep -v 'xdp' || true)
+    echo "tc events on ${IF}:"; grep -E "dev ${IF}( |\$)" "$1.tc" || echo "  (none)"
+    echo "link events on ${IF}:"; grep -E "${IF}[@:]" "$1.link" || echo "  (none)"
+    [[ -z "${del}" ]] || { echo "GAP: deletions during re-run:"; echo "${del}"; rc=1; }
+    [[ -z "${nox}" ]] || { echo "GAP: link event without XDP during re-run:"; echo "${nox}"; rc=1; }
+    return ${rc}
+}
+rerun_no_gap() {
+    local mon=${OUT}/rerun-no-gap before after rc=0
+    echo "TX queues: $(txq_count)"
+    before=$(hook_ids)
+    monitor_start "${mon}"
+    setup_op || rc=1
+    monitor_stop
+    after=$(hook_ids)
+    attached_ok || rc=1
+    echo "--- before"; echo "${before}"; echo "--- after"; echo "${after}"
+    [[ "${before}" == "${after}" ]] || { echo "qdisc handles / prog ids changed by the re-run"; rc=1; }
+    monitor_gaps "${mon}" || rc=1
+    return ${rc}
+}
+# n>=2 TX queues: setup.sh brings a wrong qdisc layout back to root mq + fq
+# children (root fq left by an older setup.sh; one child replaced by pfifo).
+mq_repair() {
+    local h rc=0
+    echo "--- root fq on a $(txq_count)-queue NIC"
+    tc qdisc replace dev "${IF}" root fq || return 1
+    tc qdisc show dev "${IF}"
+    setup_op && attached_ok || rc=1
+    h=$(tc qdisc show dev "${IF}" | sed -n 's/^qdisc mq \([0-9a-f]*\): root.*/\1/p')
+    [[ -n "${h}" ]] || return 1
+    echo "--- child of TX queue 1 (parent ${h}:2) replaced by pfifo"
+    tc qdisc replace dev "${IF}" parent "${h}:2" pfifo || return 1
+    tc qdisc show dev "${IF}"
+    setup_op && attached_ok || rc=1
+    tc qdisc show dev "${IF}"
+    # Q6-1: a root with handle 1: that is not mq belongs to someone else (setup.sh
+    # would otherwise graft its mq 1: over it): exit 3, nothing changed.
+    # The root is mq 1: now and the kernel refuses to change a qdisc's kind under
+    # the same handle ("Invalid qdisc name"), so delete the root first. First
+    # kind this kernel has (cloud kernels may lack sch_prio / sch_htb).
+    local before after src k=""
+    tc qdisc del dev "${IF}" root || return 1
+    for k in prio htb fq_codel; do tc qdisc add dev "${IF}" root handle 1: ${k} 2>/dev/null && break; k=""; done
+    [[ -n "${k}" ]] || { echo "could not create a root 'handle 1:' qdisc"; return 1; }
+    echo "--- root 'handle 1: ${k}' (not mq): setup.sh must refuse (exit 3), nothing changed"
+    before=$(attach_snapshot 2>&1)
+    setup_op; src=$?
+    after=$(attach_snapshot 2>&1)
+    echo "setup.sh rc=${src} (expect 3)"
+    [[ ${src} == 3 ]] || rc=1
+    [[ "${before}" == "${after}" ]] || { echo "state changed:"; diff <(echo "${before}") <(echo "${after}"); rc=1; }
+    tc qdisc del dev "${IF}" root || return 1
+    echo "--- after removing it: setup.sh attaches again"
+    setup_op && attached_ok || rc=1
+    return ${rc}
+}
+# Q6-3: a command failing after step 1 leaves a partial state -> exit 5 with
+# the "partially attached" message; detach.sh then cleans up and setup.sh works.
+# The failure is injected with a tc wrapper on PATH that fails `filter replace`,
+# so setup.sh runs as root here even with VT_SETUP_AS (sudo resets PATH).
+partial_exit5() {
+    local d rc out real
+    real=$(command -v tc)
+    d=$(mktemp -d /tmp/vt-faketc-XXXXXX)
+    printf '#!/bin/sh\ncase " $* " in *" filter replace "*) echo "fake tc: filter replace fails" >&2; exit 2;; esac\nexec %s "$@"\n' "${real}" > "${d}/tc"
+    chmod 755 "${d}/tc"
+    op "${ROOT}/detach.sh" "${IF}" >/dev/null || { rm -rf "${d}"; return 1; }
+    out=$(PATH="${d}:${PATH}" "${ROOT}/setup.sh" "${IF}" ${SETUP_ARGS[@]+"${SETUP_ARGS[@]}"} 2>&1); rc=$?
+    rm -rf "${d}"
+    echo "${out}" | tail -6
+    echo "setup.sh with failing 'tc filter replace' rc=${rc} (expect 5)"
+    attach_snapshot
+    [[ ${rc} == 5 ]] || return 1
+    echo "${out}" | grep -q 'partially attached' || { echo "no 'partially attached' message"; return 1; }
+    echo "--- detach.sh, then setup.sh again"
+    op "${ROOT}/detach.sh" "${IF}" >/dev/null || { echo "detach.sh after exit 5 failed"; return 1; }
+    setup_op >/dev/null && attached_ok
+}
+# Q6-2: TX queues activated after setup.sh (ethtool -L tx 2 -> 4 on a veth with
+# more allocated queues) must already have fq: setup.sh puts fq on every
+# allocated queue's class. Without a re-run: attach state OK and a -P 8 DL
+# stays within the cap; a re-run afterwards still passes.
+txq_max() { ethtool -l "${IF}" 2>/dev/null | awk '/Pre-set maximums/ {m=1} m && /^TX:/ {print $2; exit}'; }
+txq_grow() {
+    local n0 max spec=${OUT}/spec_txq_grow.csv rc=0
+    n0=$(txq_count); max=$(txq_max)
+    echo "TX queues active ${n0}, allocated ${max}"
+    op "${ROOT}/detach.sh" "${IF}" >/dev/null || return 1
+    ethtool -L "${IF}" tx 2 || return 1
+    echo "--- active TX queues 2: setup.sh"
+    setup_op && attached_ok || return 1
+    tc qdisc show dev "${IF}"
+    ethtool -L "${IF}" tx 4 || return 1
+    echo "--- active TX queues $(txq_count) (no setup.sh re-run):"
+    tc qdisc show dev "${IF}"
+    attached_ok || rc=1
+    echo "label,ue_ip,direction,cap_mbps,json_path" > "${spec}"
+    echo "A-DL-P8,10.45.1.23,DL,20,a_dl_p8.json" >> "${spec}"
+    # Runs before the main iperf3 servers exist: own server on 5205.
+    iperf3 -s -p 5205 -D; sleep 1
+    ip netns exec vt-ue-a iperf3 -c ${SVC} -p 5205 -t "${T}" -R -P 8 -J > "${OUT}/a_dl_p8.json" &
+    ( sleep 5; snap > "${OUT}/stats_grow_t1.txt" 2>&1; sleep $(( T - 6 )); snap > "${OUT}/stats_grow_t2.txt" 2>&1 ) &
+    wait
+    tc -s qdisc show dev "${IF}" | grep -E '^qdisc|Sent'
+    # Only over-cap fails here (the point is fq on the new queues).
+    python3 "${CVERDICT}" "${spec}" "${OUT}/stats_grow_t1.txt" "${OUT}/stats_grow_t2.txt" | tee "${OUT}/verdict_txq_grow.txt"
+    pkill -f 'iperf3 -s -p 5205' 2>/dev/null
+    awk '$1=="A-DL-P8" {e=$6+0; print "A-DL-P8 err " e "%"; exit !(e <= 10)}' "${OUT}/verdict_txq_grow.txt" || { echo "over cap after TX queue growth"; rc=1; }
+    # An idle run would pass the over-cap check vacuously: require traffic.
+    awk '$1=="A-DL-P8" {exit !($5+0 >= 2)}' "${OUT}/verdict_txq_grow.txt" || { echo "no DL traffic measured (iperf3 failed?)"; rc=1; }
+    echo "--- setup.sh re-run with 4 active queues"
+    setup_op && attached_ok || rc=1
+    echo "--- restore ${n0} active TX queues"
+    op "${ROOT}/detach.sh" "${IF}" >/dev/null && ethtool -L "${IF}" tx "${n0}" && setup_op && attached_ok || rc=1
+    return ${rc}
+}
+# Round 6: switch to the other XDP mode and back. Each mode must use only its
+# slot, keep TC untouched, and count UE-A's ping in the policer.
+xdp_mode_switch() {
+    local other m rc=0 r0 r1 before after rc2
+    [[ ${XDP_MODE} == generic ]] && other=native || other=generic
+    for m in ${other} ${XDP_MODE}; do
+        echo "--- setup.sh ${IF} --xdp-mode ${m}"
+        op "${ROOT}/setup.sh" "${IF}" --xdp-mode "${m}" || { echo "setup.sh --xdp-mode ${m} failed"; return 1; }
+        attached_ok "$(slot_of "${m}")" || rc=1
+        r0=$(stat_of ${UA} 3)
+        ip netns exec vt-ue-a ping -c3 -i0.2 -W1 ${SVC} >/dev/null || { echo "UE-A ping failed in ${m} mode"; rc=1; }
+        r1=$(stat_of ${UA} 3)
+        echo "${m}: UE-A rx_pkts +$(( r1 - r0 ))"
+        [[ $(( r1 - r0 )) -ge 3 ]] || { echo "policer did not count UE-A in ${m} mode"; rc=1; }
+    done
+    echo "--- flag before iface: setup.sh --xdp-mode ${XDP_MODE} ${IF}"
+    op "${ROOT}/setup.sh" --xdp-mode "${XDP_MODE}" "${IF}" && attached_ok || rc=1
+    echo "--- invalid mode: exit 1, nothing changed"
+    before=$(attach_snapshot 2>&1)
+    op "${ROOT}/setup.sh" "${IF}" --xdp-mode bogus; rc2=$?
+    after=$(attach_snapshot 2>&1)
+    echo "setup.sh --xdp-mode bogus rc=${rc2} (expect 1)"
+    [[ ${rc2} == 1 ]] || rc=1
+    [[ "${before}" == "${after}" ]] || { echo "state changed:"; diff <(echo "${before}") <(echo "${after}"); rc=1; }
+    return ${rc}
+}
+# Per-child fq "Sent" bytes: "<parent> <bytes>" per line.
+fq_sent() {
+    tc -s qdisc show dev "${IF}" | awk '/^qdisc fq / {p=($4=="root") ? "root" : $5} /^ Sent / && p {print p, $2; p=""}'
+}
+# Round 6: 4 parallel DL flows per UE (spread over the TX queues when n>=2):
+# the per-UE cap must hold for the sum (tx_bytes counters, ±10%).
+dl_multiflow() {
+    local spec=${OUT}/spec_multiflow.csv q0 q1 used
+    echo "label,ue_ip,direction,cap_mbps,json_path" > "${spec}"
+    echo "A-DL-P4,10.45.1.23,DL,20,a_dl_p4.json" >> "${spec}"
+    echo "B-DL-P4,10.45.1.24,DL,5,b_dl_p4.json"  >> "${spec}"
+    q0=$(fq_sent)
+    ip netns exec vt-ue-a iperf3 -c ${SVC} -p 5203 -t "${T}" -R -P 4 -J > "${OUT}/a_dl_p4.json" &
+    ip netns exec vt-ue-b iperf3 -c ${SVC} -p 5204 -t "${T}" -R -P 4 -J > "${OUT}/b_dl_p4.json" &
+    ( sleep 5; snap > "${OUT}/stats_mf_t1.txt" 2>&1; sleep $(( T - 6 )); snap > "${OUT}/stats_mf_t2.txt" 2>&1 ) &
+    wait
+    q1=$(fq_sent)
+    echo "fq Sent bytes per queue during the run (TX queues: $(txq_count)):"
+    used=$(LC_ALL=C join <(echo "${q0}" | LC_ALL=C sort) <(echo "${q1}" | LC_ALL=C sort) | awk '{d=$3-$2; printf "  %-8s +%d\n", $1, d > "/dev/stderr"; if (d > 100000) n++} END {print n+0}')
+    echo "queues with >100 kB: ${used}"
+    if [[ $(txq_count) -ge 2 && ${used} -lt 2 ]]; then
+        echo "WARN: all flows hashed to one TX queue; the cross-queue case was not exercised this run"
+    fi
+    python3 "${CVERDICT}" "${spec}" "${OUT}/stats_mf_t1.txt" "${OUT}/stats_mf_t2.txt"
 }
 
 HAS_FQ=0
@@ -210,27 +464,52 @@ run topology "${ROOT}/testbed/netns-topo.sh" up || exit 1
 # bpftool check precedes the fq step).
 run setup.sh-no-bpftool no_bpftool_refused
 if [[ ${HAS_FQ} == 1 ]]; then
-    run setup.sh op "${ROOT}/setup.sh" "${IF}" || exit 1
+    run setup.sh setup_op || exit 1
     # Attached interface, bpftool hidden: refuse, hooks untouched.
     run setup.sh-no-bpftool-attached no_bpftool_refused
     attach_snapshot > "${OUT}/attach-before-rerun.txt" 2>&1
-    run setup.sh-rerun op "${ROOT}/setup.sh" "${IF}"
+    run setup.sh-rerun setup_op
     attach_snapshot > "${OUT}/attach-after-rerun.txt" 2>&1
     if ! run attached-after-rerun attached_ok; then
         # The rerun failure is recorded above. Restore a clean attachment so the
         # pacing/killswitch steps below measure the datapath, not the rerun damage.
-        reattach() { op "${ROOT}/detach.sh" "${IF}" && op "${ROOT}/setup.sh" "${IF}" && attached_ok; }
+        reattach() { op "${ROOT}/detach.sh" "${IF}" && setup_op && attached_ok; }
         run setup.sh-reattach reattach || exit 1
     fi
+    # Round 6: a re-run on an attached NIC (mq + n fq children when n>=2) leaves
+    # no gap: no qdisc/filter deletion and no link event without XDP while it
+    # runs, same qdisc handles and prog ids afterwards.
+    run setup.sh-rerun-no-gap rerun_no_gap
+    if [[ $(txq_count) -ge 2 ]]; then
+        run setup.sh-mq-repair mq_repair
+    else
+        rec SKIP setup.sh-mq-repair "vt-n6 has 1 TX queue (set VT_N6_TXQ>=2)"
+    fi
+    run setup.sh-partial-exit5 partial_exit5 || { setup_op >/dev/null 2>&1; attached_ok >/dev/null 2>&1 || exit 1; }
+    TXQ_GROW_PENDING=0
+    if [[ $(txq_max) -ge 4 && $(txq_count) -lt 4 ]]; then TXQ_GROW_PENDING=1
+    else rec SKIP setup.sh-txq-grow "needs VT_N6_TXQ<4 and VT_N6_TXQ_MAX>=4 (e.g. VT_N6_TXQ=2 VT_N6_TXQ_MAX=8)"; fi
 else
     rec SKIP setup.sh "no sch_fq on this kernel; attaching without fq (TX pacing untestable)"
     run attach-manual manual_attach || exit 1
+    # Validates the xdp_slots/xdp_ok helpers used by attached_ok on L2.
+    run attach-manual-xdp-slot xdp_ok
+    rec SKIP setup.sh-rerun-no-gap "no sch_fq (L2)"
+    rec SKIP setup.sh-mq-repair "no sch_fq (L2)"
+    rec SKIP setup.sh-txq-grow "no sch_fq (L2)"
+    rec SKIP setup.sh-partial-exit5 "no sch_fq (L2)"
 fi
 
 # ---- 4. policies ----
 run set-A "${CLI}" set --ue-ip 10.45.1.23 --rx-mbps 10 --tx-mbps 20
 run set-B "${CLI}" set --ue-ip 10.45.1.24 --rx-mbps 3  --tx-mbps 5
 "${CLI}" list > "${OUT}/list.txt" 2>&1
+if [[ ${HAS_FQ} == 1 ]]; then
+    run xdp-mode-switch xdp_mode_switch
+    [[ ${TXQ_GROW_PENDING} == 1 ]] && { run setup.sh-txq-grow txq_grow || { setup_op >/dev/null 2>&1; attached_ok >/dev/null 2>&1 || exit 1; }; }
+else
+    rec SKIP xdp-mode-switch "no sch_fq: setup.sh cannot run (L2)"
+fi
 
 # ---- 5. iperf3: all sessions concurrent (README §8) ----
 for p in 5201 5202 5203 5204; do iperf3 -s -p ${p} -D; done
@@ -255,7 +534,7 @@ if [[ ${HAS_FQ} == 1 ]]; then
     # Operator re-runs setup.sh on a live host: shaping must hold through it
     # (the verdict below covers the whole run, including this moment).
     sleep $(( T / 2 ))
-    rerun_live() { op "${ROOT}/setup.sh" "${IF}" && attached_ok; }
+    rerun_live() { setup_op && attached_ok; }
     run setup.sh-rerun-under-load rerun_live
 fi
 wait
@@ -270,6 +549,9 @@ if [[ ${HAS_FQ} == 1 ]]; then
     # (a GSO skb counted once would give tens of KB).
     d16() { awk '$1=="10.45.1.23" {b=$5; p=$6} END {r=(p? b/p : 0); printf "A tx_bytes/tx_packets=%.0f\n", r; exit !(p && r <= 1514)}' "${OUT}/stats_after_iperf.txt"; }
     run d16-tx-segments d16
+    run dl-multiflow-ue-cap dl_multiflow
+else
+    rec SKIP dl-multiflow-ue-cap "no sch_fq: DL pacing untestable (L2)"
 fi
 
 # ---- 6. killswitch (no fq needed: TC_ACT_SHOT) ----
@@ -280,7 +562,7 @@ killswitch() {
     ip netns exec vt-ue-a ping -c2 -W1 ${SVC} >/dev/null || { echo "UE-A affected by UE-B killswitch"; return 1; }
     if [[ ${HAS_FQ} == 1 ]]; then
         # D3: a setup.sh re-run must not lift an active killswitch.
-        op "${ROOT}/setup.sh" "${IF}" >/dev/null || { echo "setup.sh re-run under killswitch failed"; return 1; }
+        setup_op >/dev/null || { echo "setup.sh re-run under killswitch failed"; return 1; }
         if ip netns exec vt-ue-b ping -c3 -W1 ${SVC} >/dev/null; then echo "ping succeeded under killswitch after setup.sh re-run"; return 1; fi
         echo "killswitch held across setup.sh re-run"
     fi
@@ -292,7 +574,6 @@ run killswitch killswitch
 run reset sh -c "'${CLI}' reset --ue-ip 10.45.1.24 && ! '${CLI}' list | grep -q 10.45.1.24"
 
 # ---- 7a. regressions (3rd round) ----
-UA=10.45.1.23
 # D7: reset clears the UE's rx_state_map / tx_tstamp_map entries.
 # D26: set with the same values keeps them (output says so); a changed value
 # (tx or rx) clears them.
@@ -404,14 +685,14 @@ if [[ ${HAS_FQ} == 1 ]]; then
     if id "${NONROOT_USER}" >/dev/null 2>&1 && as_user "${NONROOT_USER}" sudo -n true 2>/dev/null; then
         nonroot_cycle() {
             echo "--- rerun on live attach as ${NONROOT_USER}"
-            as_user "${NONROOT_USER}" "${ROOT}/setup.sh" "${IF}" && attached_ok || return 1
+            as_user "${NONROOT_USER}" "${ROOT}/setup.sh" "${IF}" ${SETUP_ARGS[@]+"${SETUP_ARGS[@]}"} && attached_ok || return 1
             echo "--- detach as ${NONROOT_USER}"
             as_user "${NONROOT_USER}" "${ROOT}/detach.sh" "${IF}" || return 1
             if ip link show dev "${IF}" | grep -q xdp || tc filter show dev "${IF}" egress | grep -q bpf; then
                 echo "hooks left after non-root detach.sh"; attach_snapshot; return 1
             fi
             echo "--- fresh setup as ${NONROOT_USER}"
-            as_user "${NONROOT_USER}" "${ROOT}/setup.sh" "${IF}" && attached_ok
+            as_user "${NONROOT_USER}" "${ROOT}/setup.sh" "${IF}" ${SETUP_ARGS[@]+"${SETUP_ARGS[@]}"} && attached_ok
         }
         run setup.sh-nonroot nonroot_cycle
     else
@@ -453,6 +734,12 @@ detach_clean() {
     op "${ROOT}/detach.sh" "${IF}" || return 1
     if ip link show dev "${IF}" | grep -q xdp; then echo "XDP still attached after detach.sh"; ip link show dev "${IF}"; return 1; fi
     if tc filter show dev "${IF}" egress | grep -q bpf; then echo "tc filter still attached"; return 1; fi
+    # veth is IFF_NO_QUEUE: its default root is noqueue (never mq/fq, whatever
+    # net.core.default_qdisc says), so a remaining fq/mq is Vantage's.
+    if [[ ${HAS_FQ} == 1 ]] && tc qdisc show dev "${IF}" | grep -qE '^qdisc (fq|mq) '; then
+        echo "fq/mq qdisc left after detach.sh"; tc qdisc show dev "${IF}"; return 1
+    fi
+    tc qdisc show dev "${IF}"
 }
 run detach detach_clean
 
@@ -462,7 +749,7 @@ if [[ ${HAS_FQ} == 1 ]]; then
         tc qdisc add dev "${IF}" ingress || return 1
         local before after rc
         before=$(attach_snapshot 2>&1)
-        op "${ROOT}/setup.sh" "${IF}"; rc=$?
+        setup_op; rc=$?
         after=$(attach_snapshot 2>&1)
         tc qdisc del dev "${IF}" ingress 2>/dev/null
         echo "setup.sh rc=${rc} (expect 3)"

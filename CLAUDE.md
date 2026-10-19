@@ -20,3 +20,4 @@
 | 2026-10-19 | L2에 22.04(jammy) VM 추가(`VT_RELEASE`), 비root·probe·ingress 회귀 단계, attached_ok id 기반 판정 | testbed/, skills/vantage-testbed | README가 22.04/24.04를 지원하는데 L2는 24.04만 돌려 D20(22.04 iproute2 5.15 이름 미출력)을 놓침 |
 | 2026-10-19 | 병렬 엔지니어의 L2 VM 동시 사용 금지(VM 분배 규칙) | skills/vantage-orchestrator | 3차 작업에서 datapath·control-plane이 같은 VM 핀을 동시에 사용해 실험 오염 가능성 발생 |
 | 2026-10-19 | 처리량 판정에 counter 기반 보조 판정(counter_verdict.py), 회귀 단계(D4/D6/D7/D16/D25/D26/업그레이드) 추가, L4 설치 런북을 docs/로 | testbed/, skills/vantage-testbed, docs/ | 3·4차 결함 수정 검증, X3 B안(cap=L2 전체 바이트) |
+| 2026-10-19 | L2 VM 격리 규칙 강화(라우팅·sysctl·bpffs 공유 → 테스트 중 VM 접근 금지) | skills/vantage-orchestrator | 6차에서 별도 veth를 쓴 엔지니어의 10.45.1.0/24 주소가 테스트 경로를 가로채 실행 1회 무효 |

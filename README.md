@@ -50,7 +50,7 @@ Quick path on a fresh service node: §3.2 (network) → §3.1 (packages) → §4
 - Identification key: **UE IPv4 address** (as seen on N6).
 - Policy: `{rx_bps, tx_bps}` per UE. `tx_bps = 0` is an explicit downlink **killswitch**; `rx_bps = 0` means uplink **uncapped** (not blocked). The two zeros are deliberately asymmetric: `set --rx-mbps 0 --tx-mbps 0` blocks downlink only.
 - No automation, no policy engine. An admin runs `vantage-5G set …` when they want to change something.
-- Enforcement: XDP token-bucket on ingress; tc-bpf EDT pacing on egress (relies on `fq` root qdisc).
+- Enforcement: XDP token-bucket on ingress; tc-bpf EDT pacing on egress (relies on `fq`: root `fq` on a single-queue NIC, one `fq` per TX queue under a root `mq` on a multi-queue NIC).
 - Metrics: per-UE RX/TX bytes, packets, drops via Prometheus on port 9090.
 
 Phase 2 (later) will extend the policy key to a 5-tuple LPM_TRIE for micro-segmentation. Not yet in this build.
@@ -65,7 +65,7 @@ Phase 2 (later) will extend the policy key to a 5-tuple LPM_TRIE for micro-segme
 | Kernel | Linux 5.15+ (BTF at `/sys/kernel/btf/vmlinux`) |
 | Tools | `clang`, `llvm`, `bpftool` (from `linux-tools-$(uname -r)`), `iproute2` (`tc`, `ip`), `libbpf-dev`, `libelf-dev`, `zlib1g-dev` |
 | Toolchain | Rust stable (`rustup`) |
-| NIC | XDP-capable driver preferred; `xdpgeneric` used by default so any NIC works. |
+| NIC | Any NIC: `setup.sh` attaches XDP in generic mode (`xdpgeneric`) by default. `--xdp-mode native` (`xdpdrv`) needs driver XDP support (§5). Single- or multi-queue. |
 | Privilege | Every `vantage-5G` subcommand (`load`, `unload`, `set`, `reset`, `list`, `stats`, `monitor`) needs root: the pins under `/sys/fs/bpf` are root-only. `setup.sh` / `detach.sh` run as root or as a user with `sudo` rights (they call `sudo` themselves). `make build` runs as a normal user. |
 
 `bpftool` is required by both `make build` (generates `vmlinux.h`) and `setup.sh`. On Ubuntu 22.04 **and** 24.04 there is no installable `bpftool` package (`apt install bpftool` fails with "has no installation candidate"); `/usr/sbin/bpftool` comes from `linux-tools-common` and is only a wrapper that needs the tools package of the **running** kernel, `linux-tools-$(uname -r)`. The same command works on both releases:
@@ -251,22 +251,40 @@ sudo ./target/release/vantage-5G load
 # 2) Attach the pinned programs to your N6-facing NIC.
 #    Replace enp1s0 with whatever interface faces the 5G Core (N6) — <IF> in §3.2.
 sudo ./setup.sh enp1s0
+#    or, with XDP in driver (native) mode:
+sudo ./setup.sh enp1s0 --xdp-mode native
 ```
+
+`sudo ./setup.sh <iface> [--xdp-mode generic|native]` (`--xdp-mode=native` also works; options and the interface may come in any order; `-h` prints the usage):
+
+- `generic` (default) attaches XDP with `xdpgeneric`, which works on every driver.
+- `native` attaches with `xdpdrv` and needs driver XDP support (e.g. veth, virtio_net, ixgbe, i40e, ice, mlx5). If the driver refuses, `setup.sh` prints the kernel's message and the driver name, suggests `--xdp-mode generic` and exits 3 without changing anything.
+- If a Vantage program is already attached in the other mode, `setup.sh` detaches it and attaches in the requested mode. The kernel does not allow generic and native at the same time, so RX policing pauses for that moment. If the new attach fails, the previous mode is restored with the **pinned** program and `setup.sh` exits 3 (exit 4 if even the restore fails: the NIC then has no RX policer). If the program attached before was one from an earlier `load`, its prog id changes with that restore. On several physical drivers a native attach/detach reconfigures the rings, which resets the link briefly.
 
 `load` is needed once per boot (pins under `/sys/fs/bpf` do not survive a reboot), and so is `setup.sh`. Policies are stored in the pinned map, so they are lost on reboot as well; re-run `set` for every UE afterwards.
 
 What `setup.sh` does:
 
-0. Pre-flight: refuses (exit 3, nothing changed) if the NIC already has an XDP program in native/offload mode, a generic XDP program that is not Vantage's, a non-Vantage egress filter at pref 1, or a classic `ingress` qdisc. Attached programs are identified by id against the pinned programs (`bpftool prog show pinned`), or by their kernel name via `bpftool prog show id N` (a Vantage program left from an earlier `load`), so this also works with iproute2 5.15 (Ubuntu 22.04), which prints no program names. `bpftool` is required: without a working one `setup.sh` exits 2 before changing anything (install `linux-tools-$(uname -r)`, see §3).
-1. `tc qdisc replace dev <iface> root fq` — required for `skb->tstamp` pacing.
-2. `tc qdisc add dev <iface> clsact` only if missing — hook point for the tc-bpf egress filter (never deleted by `setup.sh`).
-3. `ip -force link set dev <iface> xdpgeneric pinned /sys/fs/bpf/vantage/vantage_rx_policer` — atomic replace on re-run.
+0. Pre-flight: refuses (exit 3, nothing changed) if the NIC already has an XDP program (generic or native) that is not Vantage's, an XDP program in offload or multi mode, a non-Vantage egress filter at pref 1, a classic `ingress` qdisc, a qdisc using handle `1:` when a root `mq 1:` has to be created (multi-queue NIC, e.g. a root `prio 1:` or `htb 1:`; remove it with `sudo tc qdisc del dev <iface> root` if nothing needs it, and re-run), or if a kernel module it needs is not available (`sch_fq`, `cls_bpf`, and `sch_ingress` when `clsact` is not there yet; the check is skipped where `modprobe` or `/lib/modules/$(uname -r)` is missing, e.g. in containers). It warns if `/run/vantage-5g.default_qdisc` exists (see the cautions below). Attached programs are identified by id against the pinned programs (`bpftool prog show pinned`), or by their kernel name via `bpftool prog show id N` (a Vantage program left from an earlier `load`), so this also works with iproute2 5.15 (Ubuntu 22.04), which prints no program names. `bpftool` is required: without a working one `setup.sh` exits 2 before changing anything (install `linux-tools-$(uname -r)`, see §3).
+1. XDP: `ip -force link set dev <iface> xdpgeneric|xdpdrv pinned /sys/fs/bpf/vantage/vantage_rx_policer` — atomic replace on re-run in the same mode; a mode switch as described above. XDP comes first because it is the only step a driver can refuse (native mode); nothing else has been changed at that point.
+2. TX qdisc, by the number of TX queues N (`/sys/class/net/<iface>/queues/tx-*`):
+   - N = 1: `tc qdisc replace dev <iface> root fq`.
+   - N ≥ 2: root `mq` with handle `1:` and an `fq` on **every mq class** `1:1` … `1:<M>` (hex), where M is `numtxqueues` from `ip -d link` — the allocated TX queues, including those not in use yet. A later `ethtool -L` that raises the channel count therefore needs no `setup.sh` re-run: the new queues are already paced. If the root is already `mq` (any handle) with `fq` on every class, nothing is changed. Otherwise the root `mq 1:` is created once; while that single `tc` command runs, `net.core.default_qdisc` is set to `fq` (if it is something else) so that `mq` creates its children as `fq` from the start, and is restored right after (also on HUP/INT/TERM). Classes whose child is still not `fq` (classes of queues not in use, or when the sysctl cannot be written, as in a container) get `tc qdisc replace … parent 1:<class> fq` in one `tc -batch`.
+   `fq` honours `skb->tstamp`, which the pacer sets (EDT).
+3. `tc qdisc add dev <iface> clsact` only if missing — hook point for the tc-bpf egress filter (never deleted by `setup.sh`).
 4. `tc filter replace dev <iface> egress protocol all pref 1 handle 1 bpf da pinned /sys/fs/bpf/vantage/vantage_tx_pacer` — atomic replace on re-run; stale Vantage pacers at other prefs (left by older `setup.sh`) are removed afterwards.
-5. Verifies the result (generic XDP, root `fq`, `clsact`, exactly one Vantage egress filter, attached program ids equal to the pinned ones) and exits 4 if it is not as expected.
+5. Verifies the result (XDP in the requested mode with the pinned program id; root `fq`, or root `mq` with `fq` on every mq class; `clsact`; exactly one Vantage egress filter with the pinned program id) and exits 4 if it is not as expected.
 
-Re-running `setup.sh` on an attached NIC is safe: neither hook is removed at any point.
+If a command fails in steps 1–4, after something was already changed, `setup.sh` exits 5 with `[-] step failed (status N, setup.sh line L) after <iface> was already changed.` and `<iface> may be partially attached`. Run `sudo ./detach.sh <iface>`, fix the cause shown, and re-run.
 
-Exit codes: `0` attached and verified, `1` usage / no such interface, `2` programs not loaded (`load` first) or `bpftool` not usable, `3` conflicting hook found (nothing changed), `4` post-attach check failed (current state is printed). `setup.sh` may be run as root or by a user with `sudo` rights (`./setup.sh enp1s0`). Full table with messages: §12.9.
+Re-running `setup.sh` on an attached NIC in the same mode is safe: no hook is removed at any point, and an existing root `mq` with `fq` on every class is left untouched.
+
+Cautions:
+
+- **Switching cost (first run only).** The first switch of a multi-queue NIC to `mq` + `fq` — from the kernel's default root `mq`, from a single root `fq` left by an older `setup.sh`, or from an older layout with `fq` only on the queues in use — replaces qdiscs. Every root or per-class qdisc replacement briefly deactivates the whole device and drops the packets queued in **all** its TX queues (while pacing, a few dozen TCP retransmissions in the local test). Later re-runs do not touch the qdisc.
+- **`net.core.default_qdisc`.** Creating the root `mq` sets this global sysctl to `fq` for the duration of one `tc` call (a few ms); any other device that creates its default qdisc in that moment gets `fq` as well. `setup.sh` restores the value right after, also on HUP/INT/TERM, and leaves it alone with a warning if something else changed it meanwhile. If `setup.sh` is killed in that window (SIGKILL, OOM, power loss) the value stays `fq`; the original is kept in `/run/vantage-5g.default_qdisc` and the next run warns. To fix: `sudo sysctl -w net.core.default_qdisc=<original>; sudo rm /run/vantage-5g.default_qdisc`.
+
+Exit codes: `0` attached and verified, `1` usage (missing interface, unknown option, invalid `--xdp-mode` value) / no such interface, `2` programs not loaded (`load` first) or `bpftool` not usable, `3` refused, nothing changed (conflicting hook, qdisc on handle `1:`, missing kernel module, or the driver rejected the XDP attach, e.g. no native XDP; exception: a failed mode switch restores the previous mode with the pinned program), `4` post-attach check failed (current state is printed), or a failed mode switch could not be rolled back, `5` a change step failed after something was already changed (partially attached: `detach.sh`, fix, re-run). `setup.sh` may be run as root or by a user with `sudo` rights (`./setup.sh enp1s0`). Full table with messages: §12.9.
 
 Successful output ends with:
 
@@ -274,7 +292,10 @@ Successful output ends with:
 [+] Vantage-5G attached to enp1s0.
     - RX policer (XDP generic, id 18): /sys/fs/bpf/vantage/vantage_rx_policer
     - TX pacer  (tc egress pref 1): /sys/fs/bpf/vantage/vantage_tx_pacer
+    - TX qdisc  root fq
 ```
+
+(On a multi-queue NIC the last line reads e.g. `TX qdisc  root mq 1: + fq on all 8 mq classes (4 TX queues in use)`.)
 
 ## 6. Set / reset / inspect per-UE policy
 
@@ -372,6 +393,8 @@ A Grafana dashboard will land in `dashboards/` once the test bed is producing tr
 ## 8. Verification — Phase 1 completion criteria
 
 Phase 1 is considered done when **two UEs**, each with distinct RX/TX limits, hold their configured rates **simultaneously in both directions**. Concretely, four concurrent `iperf3` sessions.
+
+Multi-queue NICs need nothing extra: the tc egress BPF program runs before the TX queue is picked, the `fq` on each TX queue honours the `skb->tstamp` it set, and each UE has one EDT slot shared by all queues, so a UE's flows spread over several queues together stay within its cap.
 
 Assumption: two UEs registered through UERANSIM (UE-A, UE-B), Vantage loaded and attached on the service node (§5), the network prerequisites of §3.2 in place, and the service reachable at `SVC` (the service node's N6 address). The examples use `10.45.1.23` / `10.45.1.24`; **use the addresses your SMF actually assigned** (§8.1).
 
@@ -494,22 +517,24 @@ How to read it:
 
 - `iperf_verdict.py`: `steady` = mean of the per-second intervals after `--skip` seconds (default 5; drops TCP slow start and the policer's initial burst), `err%` = (steady − cap) / cap, PASS within `--tol` (default 0.10). `CV` = stdev/mean of those intervals; above `--cv-warn` (default 0.15) the row is flagged `unstable` but not failed (uplink TCP against a policer saw-tooths). A `cap_mbps` of `0` row is a killswitch check: PASS if ≤ `--kill-max` Mbps (default 0.1) or if iperf3 could not connect at all. Exit code 1 if any row fails.
 - `counter_verdict.py`: rate of `rx_bytes` (UL rows) or `tx_bytes` (DL rows) between the two snapshots; this is the number the cap governs, so expect ±1%. Rows with cap 0 are reported as `INFO`. Exit code 1 if any capped row is outside `--tol` (default 0.10).
-- **Over cap** (positive error beyond tolerance) means shaping is not applied to that traffic: check that `stats` shows the UE address at all (NAT, §3.2), that the iperf3 client was bound to the UE address (8.1), that the root qdisc of `<IF>` is `fq` (`tc qdisc show dev <IF>`) and that `ip route get <UE_IP>` on the service node leaves through `<IF>`.
+- **Over cap** (positive error beyond tolerance) means shaping is not applied to that traffic: check that `stats` shows the UE address at all (NAT, §3.2), that the iperf3 client was bound to the UE address (8.1), that `<IF>` has root `fq`, or root `mq` with `fq` on every TX queue (`tc qdisc show dev <IF>`) and that `ip route get <UE_IP>` on the service node leaves through `<IF>`.
 - **Under cap** with the counters also under cap means the bottleneck is elsewhere (radio / UERANSIM / UPF CPU); compare with a run after `reset` of both UEs (no shaping) to see the path's own capacity.
 
 ## 9. Detach & unload
 
 ```bash
-sudo ./detach.sh enp1s0                        # remove tc filter, XDP, clsact, root fq
+sudo ./detach.sh enp1s0                        # remove tc filter, XDP, clsact, root qdisc
 sudo ./target/release/vantage-5G unload         # remove pinned programs & maps
 ```
 
 - Order matters: `unload` refuses (exit 1, pins untouched) while a Vantage program is still attached to any interface in the current network namespace, and prints `run: sudo ./detach.sh <iface>`. It does not see attachments in other network namespaces.
-- `detach.sh` removes every egress filter on the interface (not only Vantage's), XDP in generic and native mode, `clsact` and the root qdisc (the kernel re-creates its default root qdisc; a previous custom root qdisc is **not** restored). It then checks the interface: exit 0 nothing left, exit 1 no such interface, **exit 4** an XDP program, egress filter or `clsact` is still there (listed; e.g. run without root/sudo). Do not `unload` after exit 4.
+- `detach.sh` removes every egress filter on the interface (not only Vantage's), XDP in both the generic and the native slot, `clsact` and the root qdisc (`fq`, or `mq 1:` with its per-queue `fq`). The kernel then re-creates its default root: on a multi-queue NIC an `mq` (handle `0:`) with one `net.core.default_qdisc` child per TX queue, on a single-queue NIC the `net.core.default_qdisc`, on veth and other no-queue devices `noqueue`. A custom root qdisc that existed before `setup.sh` is **not** restored. It then checks the interface: exit 0 nothing left, exit 1 no such interface, **exit 4** an XDP program, egress filter, `clsact` or `setup.sh`'s root `mq 1:` is still there (listed; e.g. run without root/sudo). Do not `unload` after exit 4.
 
 ## 10. Troubleshooting
 
-**`skb->tstamp` seems to be ignored (TX pacing has no effect)** — the interface's root qdisc is not `fq`. `setup.sh` sets it, but if you attach manually make sure `tc qdisc show dev <iface>` prints `qdisc fq …` at root.
+**`skb->tstamp` seems to be ignored (TX pacing has no effect)** — the packets do not go through an `fq`. `setup.sh` sets it up, but if you attach manually make sure `tc qdisc show dev <iface>` prints `qdisc fq … root` on a single-queue NIC, or `qdisc mq … root` plus one `qdisc fq … parent <mq handle>:<class>` for **every** mq class on a multi-queue NIC (a queue with `fq_codel` or `pfifo_fast` sends unpaced). Re-running `setup.sh` fixes the classes that are not `fq`.
+
+**`setup.sh --xdp-mode native` exits 3 with `XDP attach in native mode failed`** — the driver (named in the message; `virtual device` for interfaces without one) does not accept native XDP, or a driver limit (MTU, queue count) prevents it. Nothing was changed (a generic attach that was there is restored). Use the default `--xdp-mode generic`.
 
 **`open pinned ue_policy_map (run `vantage-5G load` first; needs root)`** — the CLI can't open the pinned map: either nothing is loaded (run `sudo ./target/release/vantage-5G load`, once per boot) or the command was run without `sudo`.
 
@@ -556,7 +581,7 @@ sudo ./target/release/vantage-5G set --ue-ip ... --rx-mbps ... --tx-mbps ...   #
 | `src/main.rs`          | Rust CLI: `load`, `unload`, `set`, `reset`, `list`, `stats`, `monitor`. |
 | `Cargo.toml`           | Rust deps: `libbpf-rs`, `libbpf-sys`, `prometheus`, `prometheus_exporter`, `lazy_static`, `clap`, `anyhow`. |
 | `Makefile`             | `make check / build / bpf / rust / clean`. |
-| `setup.sh`             | Attach pinned programs to a NIC, set `fq` root qdisc. |
+| `setup.sh`             | Attach pinned programs to a NIC (`--xdp-mode generic\|native`), set root `fq` or root `mq` + per-queue `fq`. |
 | `detach.sh`            | Undo `setup.sh`. |
 | `docs/install-runbook.md` | Step-by-step install and measurement runbook for a physical Ubuntu server (Korean): command / expected result / on failure for each step. |
 | `testbed/`             | Local test harness (Docker and VirtualBox VM); see [`testbed/README.md`](testbed/README.md) and §13. |
@@ -768,28 +793,28 @@ It exits (code 1) only when the HTTP server cannot start: `Error: start Promethe
 
 ### 12.9 `setup.sh` and `detach.sh`
 
-`sudo ./setup.sh <iface>` / `sudo ./detach.sh <iface>` (or without `sudo` as a user with sudo rights; they call `sudo` for each command when not root).
+`sudo ./setup.sh <iface> [--xdp-mode generic|native]` / `sudo ./detach.sh <iface>` (or without `sudo` as a user with sudo rights; they call `sudo` for each command when not root).
 
 `setup.sh`:
 
 | Exit | Meaning | Message (start) | State changed? |
 |---|---|---|---|
 | `0` | Attached and verified | `[+] Vantage-5G attached to <iface>.` | yes |
-| `1` | No argument, or interface not found. The interface is checked **after** the pins, so with nothing loaded a wrong name gives exit 2 first | `usage: sudo ./setup.sh <iface> …` / `[-] interface <iface> not found` | no |
+| `1` | No interface, more than one interface, unknown option, `--xdp-mode` without a value or with a value other than `generic`/`native`, or interface not found. The interface is checked **after** the pins, so with nothing loaded a wrong name gives exit 2 first | `usage: sudo ./setup.sh <iface> [--xdp-mode generic\|native] …` (after `[-] unknown option: …` / `[-] --xdp-mode must be 'generic' or 'native' (got '…')` / …) / `[-] interface <iface> not found` | no |
 | `2` | Programs not pinned (run `load`), or `bpftool` not usable | `[-] pinned programs not found under /sys/fs/bpf/vantage` / `[-] bpftool is not usable: …` | no |
-| `3` | Conflicting hook: native/offload XDP, someone else's generic XDP, a non-Vantage egress filter at pref 1, or an `ingress` qdisc | `[-] <iface> has an XDP program attached in '…' mode` / `… already has a generic-mode XDP program … that is not Vantage's` / `… egress pref 1 holds a non-Vantage filter` / `… has an 'ingress' qdisc` | no |
-| `4` | Post-attach verification failed | `[-] verify: …` lines, then `[-] Vantage-5G attach on <iface> is NOT in the expected state` and the current `ip`/`tc` state | partly |
-| other | A `tc`/`ip` command failed (`set -e`) | the command's own error | partly |
+| `3` | Refused: someone else's XDP program (generic or native), XDP in offload/multi mode, a non-Vantage egress filter at pref 1, an `ingress` qdisc, a qdisc using handle `1:` when root `mq 1:` must be created (multi-queue NIC), a missing kernel module (`sch_fq`, `cls_bpf`, `sch_ingress`), or the driver rejected the XDP attach (e.g. no native XDP). Exception: when moving a Vantage program to the other XDP mode fails, the previous mode is restored with the **pinned** program (its prog id may differ from the one attached before; RX policing was off for a moment; some physical NICs reset the link) | `[-] <iface> already has an XDP program in '…' mode (id …) that is not Vantage's.` / `[-] <iface> has XDP attached in '…' mode …` / `… egress pref 1 holds a non-Vantage filter` / `… has an 'ingress' qdisc` / `[-] <iface> has a qdisc using handle 1: (…); setup.sh needs that handle` / `[-] kernel module(s) not available: …` / `[-] XDP attach in <mode> mode failed: …` | no (see exception) |
+| `4` | Post-attach verification failed, or a failed mode switch could not restore the previous attach | `[-] verify: …` lines, then `[-] Vantage-5G attach on <iface> is NOT in the expected state` and the current `ip`/`tc` state / `[-] restore failed: <iface> has NO XDP RX policer now.` | partly |
+| `5` | A change step (1–4) failed after something was already changed. Run `sudo ./detach.sh <iface>`, fix the cause, re-run | `[-] step failed (status N, setup.sh line L) after <iface> was already changed.` … `may be partially attached` | partly |
 
 `detach.sh` (every removal step tolerates "already gone"):
 
 | Exit | Meaning | Message (start) |
 |---|---|---|
-| `0` | No XDP program, egress filter or `clsact` left on the interface | `[+] <iface> detached. Pinned programs and maps are still in /sys/fs/bpf/vantage.` |
+| `0` | No XDP program (either slot), egress filter, `clsact` or root `mq 1:` left on the interface | `[+] <iface> detached. Pinned programs and maps are still in /sys/fs/bpf/vantage.` |
 | `1` | No argument, or interface not found | `usage: sudo ./detach.sh <iface>` / `[-] interface <iface> not found` |
-| `4` | Something is still attached (listed) — typically run without root/sudo | `[-] <iface> is NOT fully detached (see above). …` |
+| `4` | Something is still attached (listed, including `setup.sh's root qdisc (mq 1:, per-queue fq) still present`) — typically run without root/sudo | `[-] <iface> is NOT fully detached (see above). …` |
 
-`detach.sh` removes **all** egress filters and the root qdisc on the interface, not only Vantage's (§9).
+`detach.sh` removes **all** egress filters and the root qdisc on the interface, not only Vantage's; the kernel then re-creates its default root qdisc (§9).
 
 ## 13. Local development & testing
 
@@ -799,7 +824,7 @@ The repository carries a local test harness so that changes can be checked befor
 |---|---|---|---|
 | L0 | any host with Python 3 | `python3 .claude/skills/vantage-boundary-check/scripts/contract_check.py .` | Static consistency: BPF C structs ↔ Rust, map/program names, pin paths, metrics ↔ this README |
 | L1 | Docker (privileged Ubuntu 24.04 container) | `./testbed/l1-docker.sh` | Build, verifier, `load`/`unload`, attach, uplink policing, killswitch, `reset`, upgrade paths. No `sch_fq` in Docker Desktop: `setup.sh` and downlink pacing are skipped |
-| L2 | VirtualBox Ubuntu VM (24.04 or 22.04) | `./testbed/l2-vbox.sh`, `VT_RELEASE=jammy ./testbed/l2-vbox.sh` | Everything in L1 plus `setup.sh` and §8's four concurrent sessions on an emulated N6 |
+| L2 | VirtualBox Ubuntu VM (24.04 or 22.04) | `./testbed/l2-vbox.sh`, `VT_RELEASE=jammy ./testbed/l2-vbox.sh` | Everything in L1 plus `setup.sh` (also `--xdp-mode native` and a multi-queue N6 with `VT_N6_TXQ`) and §8's four concurrent sessions on an emulated N6 |
 | L3 | Open5GS + UERANSIM VMs | not built yet | Real UE addresses through a 5G core |
 | L4 | physical server | [`docs/install-runbook.md`](docs/install-runbook.md) | Real NIC, driver and core |
 
