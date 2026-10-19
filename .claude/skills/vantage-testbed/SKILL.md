@@ -20,7 +20,7 @@ description: "Vantage-5G 로컬 테스트 실행과 물리 서버 설치 준비.
 빠른 단건 실험: `./testbed/dev.sh '<cmd>'` — 저장소 사본에서 명령 실행(예: `'make build'`, `'bpftool prog loadall vantage_tx_pacer.o /sys/fs/bpf/t type tc'`).
 
 ### 공통 테스트 본체 `testbed/run-tests.sh`
-L1·L2가 같은 스크립트를 쓴다. 운영자 경로 그대로(make build → `vantage-5G load` → `./setup.sh` → set → iperf3 → killswitch → `./detach.sh` → unload)를 실행하고, 결과 디렉토리에 `summary.txt`(PASS/FAIL/SKIP), 단계별 `.log`, iperf3 JSON, `spec.csv`, `verdict.txt`, `stats_*.txt`를 남긴다. 토폴로지는 `testbed/netns-topo.sh`(UE netns 2개 → core netns(UPF 역할) → N6 veth `vt-n6` → 서비스 노드). `VT_NAT=1`이면 Open5GS 레퍼런스처럼 MASQUERADE를 걸어 "UE IP가 안 보이는" 실패 모드를 재현한다. `VT_NETEM="delay 10ms rate 200mbit"`로 무선 구간을 흉내 낼 수 있다. `VT_SETUP_AS=ubuntu`면 setup.sh/detach.sh를 NOPASSWD sudo 사용자로 실행(D21), `VT_NO_BPFTOOL=1`이면 setup.sh에서 bpftool을 숨겨 프로브 경로를 강제한다(`setup.sh-used-probe`로 확인). 비root 단계 `setup.sh-nonroot`(사용자 `VT_NONROOT_USER`, 기본 ubuntu)와 `setup.sh-ingress-refused`(D22)는 fq가 있으면 항상 돈다. l2-vbox.sh는 이 변수들을 VM으로 넘기고 결과를 `_workspace/l2-<release>-<ts>/`에 둔다.
+L1·L2가 같은 스크립트를 쓴다. 운영자 경로 그대로(make build → `vantage-5G load` → `./setup.sh` → set → iperf3 → killswitch → `./detach.sh` → unload)를 실행하고, 결과 디렉토리에 `summary.txt`(PASS/FAIL/SKIP), 단계별 `.log`, iperf3 JSON, `spec.csv`, `verdict.txt`, `stats_*.txt`를 남긴다. 토폴로지는 `testbed/netns-topo.sh`(UE netns 2개 → core netns(UPF 역할) → N6 veth `vt-n6` → 서비스 노드). `VT_NAT=1`이면 Open5GS 레퍼런스처럼 MASQUERADE를 걸어 "UE IP가 안 보이는" 실패 모드를 재현한다. `VT_NETEM="delay 10ms rate 200mbit"`로 무선 구간을 흉내 낼 수 있다. `VT_SETUP_AS=ubuntu`면 setup.sh/detach.sh를 NOPASSWD sudo 사용자로 실행(D21). setup.sh는 bpftool 필수이므로 `setup.sh-no-bpftool`(새 iface)·`setup.sh-no-bpftool-attached`(attach 상태) 단계가 매 실행 bpftool을 숨겨 rc=2·상태 무변경을 확인한다(`VT_NO_BPFTOOL`은 호환용, 무시). 회귀 단계: `map-sizes-d25`(LRU 3개 lru_hash/16384, policy hash/1024, nproc·memlock 기록), `d7-reset-clears`, `d26-same-set-keeps-state`(같은 값 set → `(unchanged; rx/tx state kept)`, 두 상태 맵 값 동일), `d26-changed-set-clears`(tx 또는 rx 변경 → 두 맵 비움), `d6-small-pkt-no-starvation`, `d4-fwd-overload-then-tcp`(vt-src netns → root ns 포워딩 → vt-n6, D15 포함), `d16-tx-segments`(fq 있을 때), `unload-refused-while-attached`, `detach-rc`(nobody로 rc=4, 없는 iface rc=1), `upgrade-from-hash-pins`(HASH/1024로 바꾼 2차 .o) · `upgrade-from-lru1024-pins`(LRU/1024인 3차 .o): 이전 .o를 load·attach한 뒤 새 load rc=1 + `max_entries 1024 -> 16384` + 절차 → detach→unload→load→setup. iperf 판정 외에 `counter-verdict`(`scripts/counter_verdict.py`, stats rx_bytes/tx_bytes 증분 = L2 바이트, X3 B안)를 함께 남긴다. 비root 단계 `setup.sh-nonroot`(사용자 `VT_NONROOT_USER`, 기본 ubuntu)와 `setup.sh-ingress-refused`(D22)는 fq가 있으면 항상 돈다. l2-vbox.sh는 이 변수들을 VM으로 넘기고 결과를 `_workspace/l2-<release>-<ts>/`에 둔다.
 
 테스트 스크립트를 고치는 것은 이 스킬의 소유다. 제품 코드 결함을 테스트에서 우회하지 않는다 — 예: 스크립트 실행권한이 없으면 `bash setup.sh`로 돌리지 말고 FAIL로 남긴다(물리 서버에서도 똑같이 실패하므로).
 
@@ -36,6 +36,8 @@ L1·L2가 같은 스크립트를 쓴다. 운영자 경로 그대로(make build �
 ```bash
 python3 .claude/skills/vantage-testbed/scripts/iperf_verdict.py <dir>/spec.csv [--skip 5 --tol 0.10 --cv-warn 0.15]
 ```
+보조 판정(cap = L2 바이트, ACK 포함): `python3 .claude/skills/vantage-testbed/scripts/counter_verdict.py <dir>/spec.csv <dir>/stats_t1.txt <dir>/stats_t2.txt`. iperf goodput은 헤더(약 4.4%)와 반대 방향 ACK만큼 cap보다 낮게 읽힌다.
+처리량 FAIL 분류: cap **초과**는 제품 결함. 미달이면 같은 VM에서 커널 자체 셰이퍼 대조(`tc qdisc replace dev vt-n6 root fq maxrate 20mbit`, `tc filter add dev vt-n6 ingress matchall action police rate 10mbit burst 312500 drop`)와 이전 커밋 A/B를 돌려, 커널 셰이퍼도 미달이면 환경으로 분류한다.
 cap 0(killswitch)에서 연결 실패는 PASS. 진단표:
 
 | 증상 | 1순위 가설 | 구분 방법 |

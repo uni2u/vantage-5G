@@ -14,9 +14,16 @@
 #                           (operator path "./setup.sh" without sudo; D21)
 #      VT_NONROOT_USER=<u>  user for the fixed non-root setup.sh/detach.sh step
 #                           (default ubuntu; SKIP if absent or no NOPASSWD sudo)
-#      VT_NO_BPFTOOL=1      hide bpftool from setup.sh (Ubuntu 22.04 without
-#                           linux-tools-$(uname -r)) => exercises its probe path.
-#                           The test itself keeps using the real binary.
+#      VT_NO_BPFTOOL=1      accepted for compatibility; no longer needed. setup.sh
+#                           requires bpftool (exit 2, nothing changed, when it is
+#                           missing) and the setup.sh-no-bpftool step checks that
+#                           on every run. The test itself keeps using the real binary.
+#
+# Regression steps (3rd round): D4 forwarded-UDP overload -> TCP still connects,
+# D6 rx 1 Mbps + small-packet flood, D7 set/reset clear rx/tx state, D14 unload
+# refused while attached, P-M1 detach.sh exit 4/1, D19 upgrade from HASH pins.
+# 4th round: D25 LRU max_entries 16384 (map-sizes-d25, upgrade from LRU-1024
+# pins), D26 same-value set keeps rx/tx state, changed value clears it.
 
 set -u
 cd "$(dirname "$0")/.."
@@ -27,6 +34,7 @@ CLI=${ROOT}/target/release/vantage-5G
 IF=vt-n6
 SVC=10.99.0.1
 VERDICT=${ROOT}/.claude/skills/vantage-testbed/scripts/iperf_verdict.py
+CVERDICT=${ROOT}/.claude/skills/vantage-testbed/scripts/counter_verdict.py
 SETUP_AS=${VT_SETUP_AS:-}
 NONROOT_USER=${VT_NONROOT_USER:-ubuntu}
 # Real bpftool binary for the test's own checks (/usr/local/lib/vantage-testbed/bpftool:
@@ -61,12 +69,15 @@ rec() { printf '[%-4s] %-28s %s\n' "$1" "$2" "${3:-}" | tee -a "${SUMMARY}"; }
 run() { local name=$1; shift; if "$@" >"${OUT}/${name}.log" 2>&1; then rec PASS "${name}"; return 0; else rec FAIL "${name}" "see ${name}.log"; return 1; fi; }
 
 cleanup() {
+    restore_bpftool
+    # detach -> unload: unload refuses while a Vantage program is attached (D14).
     op "${ROOT}/detach.sh" "${IF}" >/dev/null 2>&1 || true
     ip link set dev "${IF}" xdpgeneric off 2>/dev/null || true
-    "${CLI}" unload >/dev/null 2>&1 || true
+    tc qdisc del dev "${IF}" clsact 2>/dev/null || true
     pkill -x iperf3 2>/dev/null || true
+    ip netns del vt-src 2>/dev/null || true; ip link del vt-s0 2>/dev/null || true
     "${ROOT}/testbed/netns-topo.sh" down >/dev/null 2>&1 || true
-    restore_bpftool
+    "${CLI}" unload >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -100,6 +111,37 @@ attached_ok() {
     [[ $(echo "${filt}" | grep -c 'handle') == 1 ]] || { echo "unexpected extra egress filters"; err=1; }
     [[ ${err} == 0 ]] || attach_snapshot
     return ${err}
+}
+
+# Counter of UE $1, column $2 of `vantage-5G stats` (2 rx_bytes 3 rx_pkts
+# 4 rx_drops 5 tx_bytes 6 tx_pkts 7 tx_drops); 0 when the UE has no stats yet.
+stat_of() { "${CLI}" stats --ue-ip "$1" 2>/dev/null | awk -v c="$2" 'NR==2 && $c ~ /^[0-9]+$/ {v=$c} END {print v+0}'; }
+snap() { echo "t=$(date +%s.%N)"; "${CLI}" stats; }
+now_s() { date +%s.%N; }
+ipkey() { echo "$1" | tr . ' '; }
+has_state() { "${BPFTOOL}" map lookup pinned "/sys/fs/bpf/vantage/$1" key $(ipkey "$2") >/dev/null 2>&1; }
+# Attach the loaded programs: setup.sh where fq exists, otherwise the L1 manual path.
+attach() {
+    if [[ ${HAS_FQ} == 1 ]]; then op "${ROOT}/setup.sh" "${IF}" && attached_ok
+    else manual_attach; fi
+}
+manual_attach() {
+    tc qdisc replace dev "${IF}" clsact &&
+    ip link set dev "${IF}" xdpgeneric pinned /sys/fs/bpf/vantage/vantage_rx_policer &&
+    tc filter add dev "${IF}" egress bpf da pinned /sys/fs/bpf/vantage/vantage_tx_pacer
+}
+is_attached_any() { ip -d link show dev "${IF}" | grep -q 'prog/xdp' || tc filter show dev "${IF}" egress | grep -q bpf; }
+# setup.sh without bpftool must refuse (exit 2) before changing anything (D23/D24/O12).
+no_bpftool_refused() {
+    local before after rc
+    hide_bpftool || { echo "could not hide bpftool"; restore_bpftool; return 1; }
+    before=$(attach_snapshot 2>&1)
+    op "${ROOT}/setup.sh" "${IF}"; rc=$?
+    after=$(attach_snapshot 2>&1)
+    restore_bpftool
+    echo "setup.sh rc=${rc} (expect 2)"
+    [[ ${rc} == 2 ]] || return 1
+    [[ "${before}" == "${after}" ]] || { echo "state changed:"; diff <(echo "${before}") <(echo "${after}"); return 1; }
 }
 
 HAS_FQ=0
@@ -141,20 +183,36 @@ cleanup >/dev/null 2>&1
 pins_ok() { "${CLI}" load && ls /sys/fs/bpf/vantage/{vantage_rx_policer,vantage_tx_pacer,ue_policy_map,ue_stats_map,rx_state_map,tx_tstamp_map}; }
 run load pins_ok || { ls -R /sys/fs/bpf >> "${OUT}/load.log" 2>&1; rec SKIP "rest" "load failed"; exit 1; }
 run load-idempotent "${CLI}" load
+# D25: the three LRU state maps hold 16384 entries (pre-6.16 per-CPU LRU
+# free lists take 128 entries per allocating CPU); policy map stays HASH 1024.
+# Also records nproc and memlock (fully preallocated at load) for the README.
+map_sizes() {
+    local m line rc=0 tot=0 ml
+    echo "nproc=$(nproc) kernel=$(uname -r) bpftool=$("${BPFTOOL}" version | head -1)"
+    for m in rx_state_map tx_tstamp_map ue_stats_map ue_policy_map; do
+        line=$("${BPFTOOL}" map show pinned /sys/fs/bpf/vantage/${m} | tr '\n' ' ')
+        echo "${line}"
+        if [[ ${m} == ue_policy_map ]]; then
+            echo "${line}" | grep -qE "^[0-9]+: hash .*max_entries 1024 " || { echo "${m}: expect hash max_entries 1024"; rc=1; }
+        else
+            echo "${line}" | grep -qE "^[0-9]+: lru_hash .*max_entries 16384 " || { echo "${m}: expect lru_hash max_entries 16384"; rc=1; }
+            ml=$(echo "${line}" | sed -n 's/.*memlock \([0-9]*\)B.*/\1/p'); tot=$(( tot + ${ml:-0} ))
+        fi
+    done
+    echo "LRU memlock total: ${tot} B ($(( tot / 1024 )) KiB)"
+    return ${rc}
+}
+run map-sizes-d25 map_sizes
 
 # ---- 3. topology + attach ----
-if [[ "${VT_NO_BPFTOOL:-0}" == 1 ]]; then
-    # From here on setup.sh/detach.sh see no bpftool (restored in cleanup; hidden only after
-    # the pre-load cleanup above, which would restore it).
-    run hide-bpftool hide_bpftool || exit 1
-fi
 run topology "${ROOT}/testbed/netns-topo.sh" up || exit 1
+# Fresh interface, bpftool hidden: exit 2 before step 1 (runs on L1 too: the
+# bpftool check precedes the fq step).
+run setup.sh-no-bpftool no_bpftool_refused
 if [[ ${HAS_FQ} == 1 ]]; then
     run setup.sh op "${ROOT}/setup.sh" "${IF}" || exit 1
-    if [[ "${VT_NO_BPFTOOL:-0}" == 1 ]]; then
-        # Guard against the test silently exercising the bpftool path instead.
-        run setup.sh-used-probe grep -q 'source: probe' "${OUT}/setup.sh.log"
-    fi
+    # Attached interface, bpftool hidden: refuse, hooks untouched.
+    run setup.sh-no-bpftool-attached no_bpftool_refused
     attach_snapshot > "${OUT}/attach-before-rerun.txt" 2>&1
     run setup.sh-rerun op "${ROOT}/setup.sh" "${IF}"
     attach_snapshot > "${OUT}/attach-after-rerun.txt" 2>&1
@@ -166,11 +224,6 @@ if [[ ${HAS_FQ} == 1 ]]; then
     fi
 else
     rec SKIP setup.sh "no sch_fq on this kernel; attaching without fq (TX pacing untestable)"
-    manual_attach() {
-        tc qdisc replace dev "${IF}" clsact &&
-        ip link set dev "${IF}" xdpgeneric pinned /sys/fs/bpf/vantage/vantage_rx_policer &&
-        tc filter add dev "${IF}" egress bpf da pinned /sys/fs/bpf/vantage/vantage_tx_pacer
-    }
     run attach-manual manual_attach || exit 1
 fi
 
@@ -196,6 +249,8 @@ if [[ ${HAS_FQ} == 1 ]]; then
 else
     rec SKIP dl-pacing "no sch_fq"
 fi
+# X3 (B): counter snapshots for the L2-byte verdict, same skip window as iperf_verdict.
+( sleep 5; snap > "${OUT}/stats_t1.txt" 2>&1; sleep $(( T - 6 )); snap > "${OUT}/stats_t2.txt" 2>&1 ) &
 if [[ ${HAS_FQ} == 1 ]]; then
     # Operator re-runs setup.sh on a live host: shaping must hold through it
     # (the verdict below covers the whole run, including this moment).
@@ -207,6 +262,15 @@ wait
 "${CLI}" stats > "${OUT}/stats_after_iperf.txt" 2>&1
 python3 "${VERDICT}" "${SPEC}" > "${OUT}/verdict.txt" 2>&1 && rec PASS iperf-verdict || rec FAIL iperf-verdict "see verdict.txt"
 cat "${OUT}/verdict.txt"
+python3 "${CVERDICT}" "${SPEC}" "${OUT}/stats_t1.txt" "${OUT}/stats_t2.txt" > "${OUT}/verdict_counters.txt" 2>&1 \
+    && rec PASS counter-verdict || rec FAIL counter-verdict "see verdict_counters.txt"
+cat "${OUT}/verdict_counters.txt"
+if [[ ${HAS_FQ} == 1 ]]; then
+    # D16: tx_packets counts wire segments, so bytes/packet <= one MTU frame
+    # (a GSO skb counted once would give tens of KB).
+    d16() { awk '$1=="10.45.1.23" {b=$5; p=$6} END {r=(p? b/p : 0); printf "A tx_bytes/tx_packets=%.0f\n", r; exit !(p && r <= 1514)}' "${OUT}/stats_after_iperf.txt"; }
+    run d16-tx-segments d16
+fi
 
 # ---- 6. killswitch (no fq needed: TC_ACT_SHOT) ----
 killswitch() {
@@ -226,6 +290,114 @@ run killswitch killswitch
 
 # ---- 7. reset ----
 run reset sh -c "'${CLI}' reset --ue-ip 10.45.1.24 && ! '${CLI}' list | grep -q 10.45.1.24"
+
+# ---- 7a. regressions (3rd round) ----
+UA=10.45.1.23
+# D7: reset clears the UE's rx_state_map / tx_tstamp_map entries.
+# D26: set with the same values keeps them (output says so); a changed value
+# (tx or rx) clears them.
+state_val() { "${BPFTOOL}" map lookup pinned "/sys/fs/bpf/vantage/$1" key $(ipkey "$2") 2>/dev/null; }
+d7_seed() {
+    "${CLI}" set --ue-ip ${UA} --rx-mbps ${1} --tx-mbps ${2} || return 1
+    ip netns exec vt-ue-a ping -c2 -W1 ${SVC} >/dev/null || { echo "ping failed"; return 1; }
+    local m; for m in rx_state_map tx_tstamp_map; do has_state ${m} ${UA} || { echo "${m}: no entry after traffic"; return 1; }; done
+}
+d7_gone() { local m; for m in rx_state_map tx_tstamp_map; do has_state ${m} ${UA} && { echo "${m}: entry left after $1"; return 1; }; done; echo "$1 cleared both"; }
+d7() {
+    d7_seed 10 20 || return 1
+    "${CLI}" reset --ue-ip ${UA} || return 1
+    d7_gone reset
+}
+d7_same() {
+    local m out b_rx b_tx
+    d7_seed 10 20 || return 1
+    b_rx=$(state_val rx_state_map ${UA}); b_tx=$(state_val tx_tstamp_map ${UA})
+    out=$("${CLI}" set --ue-ip ${UA} --rx-mbps 10 --tx-mbps 20) || return 1
+    echo "${out}"
+    echo "${out}" | grep -qF '(unchanged; rx/tx state kept)' || { echo "missing '(unchanged; rx/tx state kept)'"; return 1; }
+    for m in rx_state_map tx_tstamp_map; do has_state ${m} ${UA} || { echo "${m}: entry removed by same-value set"; return 1; }; done
+    # No traffic in between: the entries must be the very same values.
+    [[ "$(state_val rx_state_map ${UA})" == "${b_rx}" && "$(state_val tx_tstamp_map ${UA})" == "${b_tx}" ]] \
+        || { echo "state values changed by same-value set"; return 1; }
+    "${CLI}" list | grep -F "${UA}" || true
+    echo "same-value set kept both (values identical)"
+}
+d7_changed() {
+    local out
+    d7_seed 10 20 || return 1
+    out=$("${CLI}" set --ue-ip ${UA} --rx-mbps 10 --tx-mbps 30) || return 1
+    echo "${out}"
+    echo "${out}" | grep -qF 'unchanged' && { echo "tx change reported as unchanged"; return 1; }
+    d7_gone "tx change (20->30)" || return 1
+    d7_seed 10 30 || return 1
+    "${CLI}" set --ue-ip ${UA} --rx-mbps 11 --tx-mbps 30 || return 1
+    d7_gone "rx change (10->11)"
+}
+run d7-reset-clears d7
+run d26-same-set-keeps-state d7_same
+run d26-changed-set-clears d7_changed
+
+# D6: rx 1 Mbps + 64 B UDP flood (~100+ kpps offered) -> admitted rate ~1 Mbps, not starved.
+d6() {
+    local r0 r1 t0 t1 mbps rc=0
+    "${CLI}" set --ue-ip ${UA} --rx-mbps 1 --tx-mbps 100 || return 1
+    r0=$(stat_of ${UA} 2); t0=$(now_s)
+    ip netns exec vt-ue-a iperf3 -c ${SVC} -p 5201 -u -l 64 -b 64M -t 10 -J > "${OUT}/d6_udp.json"
+    r1=$(stat_of ${UA} 2); t1=$(now_s)
+    mbps=$(python3 -c 'import sys;a=[float(x) for x in sys.argv[1:]];print("%.3f"%((a[1]-a[0])*8/(a[3]-a[2])/1e6))' ${r0} ${r1} ${t0} ${t1})
+    python3 -c 'import json,sys;e=json.load(open(sys.argv[1]))["end"]["sum"];print("offered %.1f Mbps, %d datagrams"%(e["bits_per_second"]/1e6,e.get("packets",0)))' "${OUT}/d6_udp.json" 2>/dev/null
+    echo "rx_bytes rate ${mbps} Mbps (cap 1, expect ~1.05 incl. initial 67 KB bucket)"
+    python3 -c "import sys;sys.exit(0 if 0.9<=float(sys.argv[1])<=1.2 else 1)" "${mbps}" || rc=1
+    "${CLI}" set --ue-ip ${UA} --rx-mbps 10 --tx-mbps 20
+    return ${rc}
+}
+run d6-small-pkt-no-starvation d6
+
+# D4: forwarded DL (no socket backpressure) far over a 1 Mbps cap must not push the
+# EDT slot past the 2 s horizon; TCP right after must connect. Local -R UDP does not
+# reproduce it (sndbuf backpressure), so traffic comes from vt-src via root-ns forwarding.
+d4() {
+    local fwd0 d0 d1 r0 r1 lead mbps rc=0
+    fwd0=$(sysctl -n net.ipv4.ip_forward)
+    ip netns add vt-src && ip link add vt-s0 type veth peer name vt-s1 && ip link set vt-s1 netns vt-src || return 1
+    ip addr add 10.98.0.1/24 dev vt-s0; ip link set vt-s0 up
+    ip -n vt-src addr add 10.98.0.2/24 dev vt-s1; ip -n vt-src link set vt-s1 up; ip -n vt-src link set lo up
+    ip -n vt-src route add default via 10.98.0.1
+    sysctl -qw net.ipv4.ip_forward=1
+    ip netns exec vt-ue-a iperf3 -s -p 5301 -D; ip netns exec vt-ue-a iperf3 -s -p 5302 -D; sleep 1
+    "${CLI}" set --ue-ip ${UA} --rx-mbps 0 --tx-mbps 1 || rc=1
+    d0=$(stat_of ${UA} 7); r0=$(stat_of ${UA} 2)
+    ip netns exec vt-src iperf3 -c ${UA} -p 5301 -u -b 100M -t 10 -J > "${OUT}/d4_udp.json"
+    d1=$(stat_of ${UA} 7)
+    lead=$("${BPFTOOL}" -j map lookup pinned /sys/fs/bpf/vantage/tx_tstamp_map key $(ipkey ${UA}) 2>/dev/null | python3 -c '
+import json,sys,struct,time
+try:
+    v=bytes(int(x,16) for x in json.load(sys.stdin)["value"])
+    print("%.3f"%((struct.unpack("<Q",v)[0]-time.clock_gettime_ns(time.CLOCK_MONOTONIC))/1e9))
+except Exception: print("none")')
+    echo "UDP 100M fwd @1 Mbps: tx_drops +$((d1 - d0)), tx_tstamp - now = ${lead} s (limit 2 s)"
+    tc -s qdisc show dev "${IF}" | grep -A2 '^qdisc fq' | grep -E 'dropped|horizon'
+    timeout 40 ip netns exec vt-src iperf3 -c ${UA} -p 5302 -t 10 -J > "${OUT}/d4_tcp.json"; local trc=$?
+    r1=$(stat_of ${UA} 2)
+    mbps=$(python3 -c 'import json,sys;j=json.load(open(sys.argv[1]));print("%.3f"%(j["end"]["sum_received"]["bits_per_second"]/1e6))' "${OUT}/d4_tcp.json" 2>/dev/null || echo 0)
+    echo "TCP fwd right after: rc=${trc} received ${mbps} Mbps"
+    echo "D15: rx_bps=0 UE rx_bytes +$((r1 - r0)) (must count)"
+    [[ $((d1 - d0)) -gt 0 ]] || { echo "tx_drops did not increase"; rc=1; }
+    [[ "${lead}" != none ]] && python3 -c "import sys;sys.exit(0 if float(sys.argv[1])<=2.1 else 1)" "${lead}" \
+        || { echo "EDT slot beyond 2 s horizon (or unreadable)"; rc=1; }
+    [[ ${trc} == 0 ]] && python3 -c "import sys;sys.exit(0 if float(sys.argv[1])>=0.3 else 1)" "${mbps}" \
+        || { echo "TCP after overload failed/blackholed"; rc=1; }
+    if [[ ${HAS_FQ} == 1 ]]; then
+        python3 -c "import sys;sys.exit(0 if float(sys.argv[1])<=1.1 else 1)" "${mbps}" || { echo "TCP over 1 Mbps cap"; rc=1; }
+    fi
+    [[ $((r1 - r0)) -gt 0 ]] || { echo "D15: rx counters not updated for rx_bps=0"; rc=1; }
+    pkill -f 'iperf3 -s -p 530[12]' 2>/dev/null
+    ip netns del vt-src; ip link del vt-s0 2>/dev/null
+    sysctl -qw net.ipv4.ip_forward="${fwd0}"
+    "${CLI}" set --ue-ip ${UA} --rx-mbps 10 --tx-mbps 20
+    return ${rc}
+}
+run d4-fwd-overload-then-tcp d4
 
 # ---- 7b. D21: setup.sh/detach.sh as a non-root NOPASSWD-sudo user ----
 if [[ ${HAS_FQ} == 1 ]]; then
@@ -248,6 +420,35 @@ if [[ ${HAS_FQ} == 1 ]]; then
 fi
 
 # ---- 8. detach + unload ----
+# D14: unload must refuse while attached, pins untouched, hooks untouched.
+unload_guard() {
+    local before after out
+    before=$(ls /sys/fs/bpf/vantage)
+    if out=$("${CLI}" unload 2>&1); then echo "${out}"; echo "unload succeeded while attached"; return 1; fi
+    echo "${out}"
+    echo "${out}" | grep -q "detach.sh ${IF}" || { echo "no detach.sh hint for ${IF}"; return 1; }
+    after=$(ls /sys/fs/bpf/vantage)
+    [[ "${before}" == "${after}" ]] || { echo "pins changed"; return 1; }
+    if [[ ${HAS_FQ} == 1 ]]; then attached_ok; else is_attached_any; fi
+}
+run unload-refused-while-attached unload_guard
+# P-M1: detach.sh exits 4 when hooks remain (here: unprivileged user, no sudo),
+# 1 for a missing interface.
+detach_rc() {
+    local d rc before after
+    d=$(mktemp -d /tmp/vt-detach-XXXXXX); cp "${ROOT}/detach.sh" "${d}/"; chmod 755 "${d}" "${d}/detach.sh"
+    before=$(attach_snapshot 2>&1)
+    timeout 30 setpriv --reuid=nobody --regid=nogroup --clear-groups -- "${d}/detach.sh" "${IF}" </dev/null; rc=$?
+    after=$(attach_snapshot 2>&1)
+    echo "detach.sh as nobody rc=${rc} (expect 4)"
+    [[ ${rc} == 4 ]] || { rm -rf "${d}"; return 1; }
+    [[ "${before}" == "${after}" ]] || { echo "state changed"; rm -rf "${d}"; return 1; }
+    "${d}/detach.sh" vt-nonexistent0; rc=$?
+    rm -rf "${d}"
+    echo "detach.sh missing iface rc=${rc} (expect 1)"
+    [[ ${rc} == 1 ]]
+}
+run detach-rc detach_rc
 detach_clean() {
     op "${ROOT}/detach.sh" "${IF}" || return 1
     if ip link show dev "${IF}" | grep -q xdp; then echo "XDP still attached after detach.sh"; ip link show dev "${IF}"; return 1; fi
@@ -276,6 +477,58 @@ unload_clean() {
     [[ -z "${left}" ]] || { echo "pins left in /sys/fs/bpf: ${left}"; return 1; }
 }
 run unload unload_clean
+
+# ---- 9. D19 upgrade: an older build loaded + attached, then the new build ----
+# $1=hash   : 2nd-round release (state maps HASH, 1024 entries)
+# $1=lru1024: 3rd-round build (LRU_HASH, 1024 entries; D25 changes only max_entries)
+upgrade() {
+    local variant=$1 od s out rc m oldtype exp
+    od=$(mktemp -d /tmp/vt-old-XXXXXX)
+    for s in vantage_rx_policer vantage_tx_pacer; do
+        if [[ ${variant} == hash ]]; then
+            sed -e 's/BPF_MAP_TYPE_LRU_HASH/BPF_MAP_TYPE_HASH/' -e 's/max_entries, 16384/max_entries, 1024/' "${ROOT}/${s}.c" > "${od}/${s}.c"
+        else
+            sed -e 's/max_entries, 16384/max_entries, 1024/' "${ROOT}/${s}.c" > "${od}/${s}.c"
+        fi
+        grep -q 'max_entries, 16384' "${od}/${s}.c" && { echo "old build still has 16384"; return 1; }
+        clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -I"${ROOT}" -c "${od}/${s}.c" -o "${od}/${s}.o" || return 1
+    done
+    [[ ${variant} == hash ]] && oldtype=hash || oldtype=lru_hash
+    echo "--- old build (${variant}): load + attach + set"
+    (cd "${od}" && "${CLI}" load) || return 1
+    "${BPFTOOL}" map show pinned /sys/fs/bpf/vantage/rx_state_map | tr '\n' ' ' | grep -qE "^[0-9]+: ${oldtype} .*max_entries 1024 " \
+        || { echo "old rx_state_map not ${oldtype}/1024"; return 1; }
+    attach || return 1
+    "${CLI}" set --ue-ip ${UA} --rx-mbps 10 --tx-mbps 20 || return 1
+    echo "--- new build on old pins: load must refuse (rc=1) with the procedure, nothing changed"
+    local before after; before=$(attach_snapshot 2>&1; ls /sys/fs/bpf/vantage)
+    out=$("${CLI}" load 2>&1); rc=$?
+    echo "${out}"
+    after=$(attach_snapshot 2>&1; ls /sys/fs/bpf/vantage)
+    [[ ${rc} == 1 ]] || { echo "load rc=${rc} (expect 1)"; return 1; }
+    echo "${out}" | grep -q 'do not match' && echo "${out}" | grep -q 'detach.sh' && echo "${out}" | grep -q 'unload' \
+        || { echo "upgrade hint missing"; return 1; }
+    echo "${out}" | grep -q 'max_entries 1024 -> 16384' || { echo "max_entries difference not reported"; return 1; }
+    [[ "${before}" == "${after}" ]] || { echo "state changed by refused load"; return 1; }
+    "${CLI}" list | grep -q ${UA} || { echo "policy lost by refused load"; return 1; }
+    echo "--- documented procedure: detach -> unload -> load -> setup -> set"
+    op "${ROOT}/detach.sh" "${IF}" || return 1
+    "${CLI}" unload || return 1
+    "${CLI}" load || return 1
+    attach || return 1
+    for m in rx_state_map tx_tstamp_map ue_stats_map; do
+        "${BPFTOOL}" map show pinned /sys/fs/bpf/vantage/${m} | tr '\n' ' ' | grep -qE "^[0-9]+: lru_hash .*max_entries 16384 " \
+            || { echo "${m} not lru_hash/16384 after upgrade"; return 1; }
+    done
+    "${CLI}" list | grep -q ${UA} && { echo "policy survived unload?"; return 1; }
+    "${CLI}" set --ue-ip ${UA} --rx-mbps 10 --tx-mbps 20 || return 1
+    ip netns exec vt-ue-a ping -c2 -W1 ${SVC} >/dev/null || { echo "UE-A unreachable after upgrade"; return 1; }
+    [[ $(stat_of ${UA} 6) -gt 0 ]] || { echo "no tx counters after upgrade"; return 1; }
+    rm -rf "${od}"
+    op "${ROOT}/detach.sh" "${IF}" && "${CLI}" unload
+}
+run upgrade-from-hash-pins upgrade hash
+run upgrade-from-lru1024-pins upgrade lru1024
 
 echo
 echo "results: ${OUT}"

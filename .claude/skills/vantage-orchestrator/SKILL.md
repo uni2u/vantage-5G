@@ -65,6 +65,7 @@ description: "Vantage-5G(eBPF XDP/tc EDT per-UE 대역폭 제어 + Rust CLI) 개
 2. 통신 규칙:
    - 계약 변경은 반드시 `_workspace/01_contract.md`를 먼저 갱신한 뒤 상대 엔지니어에게 SendMessage.
    - 각 엔지니어는 자기 모듈 완료 직후 boundary-qa에게 검증 요청(점진 QA).
+   - **L2 VM은 공유 자원이다.** 병렬 엔지니어에게 VM을 나눠 준다(예: datapath → noble 2522, control-plane → jammy 2523) 또는 순서를 정한다. 같은 VM의 bpffs 핀(`/sys/fs/bpf/vantage`)과 인터페이스를 동시에 쓰면 서로의 load/unload·가드가 간섭해 결과가 오염된다.
 3. 리더는 계약 충돌 에스컬레이션을 받으면 사용자 의도에 비추어 결정하고 계약 파일에 기록한다.
 
 ## Phase 4: 경계면 QA

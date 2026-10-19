@@ -18,3 +18,5 @@
 | 2026-10-19 | L2를 Multipass → VirtualBox(`testbed/l2-vbox.sh`, 클라우드 이미지+cloud-init, SSH+rsync)로 교체 | testbed/, skills/vantage-testbed, 오케스트레이터 | Multipass 데몬이 로컬 네트워크 권한·이미지 잠금 문제로 불안정, 사용자 결정 |
 | 2026-10-19 | dev 이미지에 sudo·rustfmt·clippy 추가, run-tests.sh verifier 임시 핀 이름 수정(bpffs는 `.` 포함 이름 거부)·루트 잔여 핀 기록·D3 이후 재부착 단계 | testbed/ | 첫 BLOCKER 수정 회귀 테스트에서 테스트 결함 4건 발견 |
 | 2026-10-19 | L2에 22.04(jammy) VM 추가(`VT_RELEASE`), 비root·probe·ingress 회귀 단계, attached_ok id 기반 판정 | testbed/, skills/vantage-testbed | README가 22.04/24.04를 지원하는데 L2는 24.04만 돌려 D20(22.04 iproute2 5.15 이름 미출력)을 놓침 |
+| 2026-10-19 | 병렬 엔지니어의 L2 VM 동시 사용 금지(VM 분배 규칙) | skills/vantage-orchestrator | 3차 작업에서 datapath·control-plane이 같은 VM 핀을 동시에 사용해 실험 오염 가능성 발생 |
+| 2026-10-19 | 처리량 판정에 counter 기반 보조 판정(counter_verdict.py), 회귀 단계(D4/D6/D7/D16/D25/D26/업그레이드) 추가, L4 설치 런북을 docs/로 | testbed/, skills/vantage-testbed, docs/ | 3·4차 결함 수정 검증, X3 B안(cap=L2 전체 바이트) |
