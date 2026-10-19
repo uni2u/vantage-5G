@@ -17,3 +17,4 @@
 | 2026-10-19 | 로컬 검증 레벨(L1 Docker/L2 Multipass) 도입, testbed/ 스크립트 추가, testbed-runbook-writer→testbed-engineer, vantage-testbed-runbook→vantage-testbed, LINUX-VERIFY→VERIFY-Lx | 전체 | 목표가 "로컬 최대 검증 후 물리 서버 설치"로 확정, Docker Desktop에 sch_fq 없음 확인 |
 | 2026-10-19 | L2를 Multipass → VirtualBox(`testbed/l2-vbox.sh`, 클라우드 이미지+cloud-init, SSH+rsync)로 교체 | testbed/, skills/vantage-testbed, 오케스트레이터 | Multipass 데몬이 로컬 네트워크 권한·이미지 잠금 문제로 불안정, 사용자 결정 |
 | 2026-10-19 | dev 이미지에 sudo·rustfmt·clippy 추가, run-tests.sh verifier 임시 핀 이름 수정(bpffs는 `.` 포함 이름 거부)·루트 잔여 핀 기록·D3 이후 재부착 단계 | testbed/ | 첫 BLOCKER 수정 회귀 테스트에서 테스트 결함 4건 발견 |
+| 2026-10-19 | L2에 22.04(jammy) VM 추가(`VT_RELEASE`), 비root·probe·ingress 회귀 단계, attached_ok id 기반 판정 | testbed/, skills/vantage-testbed | README가 22.04/24.04를 지원하는데 L2는 24.04만 돌려 D20(22.04 iproute2 5.15 이름 미출력)을 놓침 |

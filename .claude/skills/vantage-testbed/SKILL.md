@@ -13,14 +13,14 @@ description: "Vantage-5G 로컬 테스트 실행과 물리 서버 설치 준비.
 |---|---|---|---|---|
 | L0 | macOS 호스트 | `python3 .claude/skills/vantage-boundary-check/scripts/contract_check.py .` | C↔Rust↔스크립트↔README 계약 | 실행 전부 |
 | L1 | Docker Desktop (커널 linuxkit, 특권 컨테이너) | `./testbed/l1-docker.sh` | build, verifier, `load`/핀, 멱등 load, attach, UL RX 셰이핑(동시 2세션), killswitch, reset, detach/unload 잔존물 | **sch_fq 없음** → setup.sh, DL EDT 페이싱 SKIP |
-| L2 | VirtualBox Ubuntu 24.04 VM `vantage-svc` (클라우드 이미지 + cloud-init, SSH 127.0.0.1:2522) | `./testbed/l2-vbox.sh` | L1 전부 + setup.sh(재실행 포함) + DL 페이싱 + README §8 4세션 동시 | 실제 5G 경로, 물리 NIC |
+| L2 | VirtualBox Ubuntu VM: `VT_RELEASE=noble`(기본, 24.04, `vantage-svc`, SSH :2522) / `jammy`(22.04, iproute2 5.15, `vantage-svc-jammy`, SSH :2523) | `[VT_RELEASE=jammy] ./testbed/l2-vbox.sh` | L1 전부 + setup.sh(재실행·비root·ingress 거부 포함) + DL 페이싱 + README §8 4세션 동시. 지원 OS 둘 다 돌린다 | 실제 5G 경로, 물리 NIC |
 | L3 | VirtualBox VM 2대 (core: Open5GS+UERANSIM, svc: Vantage) | (구축 예정 — 아래) | 실제 UE IP가 N6에 보이는지(NAT), GTP 경로 뒤의 셰이핑 | 물리 NIC native XDP |
 | L4 | 물리 서버 | `_workspace/05_install_runbook.md` (사용자 실행) | 실제 NIC·드라이버·실 Core | — |
 
 빠른 단건 실험: `./testbed/dev.sh '<cmd>'` — 저장소 사본에서 명령 실행(예: `'make build'`, `'bpftool prog loadall vantage_tx_pacer.o /sys/fs/bpf/t type tc'`).
 
 ### 공통 테스트 본체 `testbed/run-tests.sh`
-L1·L2가 같은 스크립트를 쓴다. 운영자 경로 그대로(make build → `vantage-5G load` → `./setup.sh` → set → iperf3 → killswitch → `./detach.sh` → unload)를 실행하고, 결과 디렉토리에 `summary.txt`(PASS/FAIL/SKIP), 단계별 `.log`, iperf3 JSON, `spec.csv`, `verdict.txt`, `stats_*.txt`를 남긴다. 토폴로지는 `testbed/netns-topo.sh`(UE netns 2개 → core netns(UPF 역할) → N6 veth `vt-n6` → 서비스 노드). `VT_NAT=1`이면 Open5GS 레퍼런스처럼 MASQUERADE를 걸어 "UE IP가 안 보이는" 실패 모드를 재현한다. `VT_NETEM="delay 10ms rate 200mbit"`로 무선 구간을 흉내 낼 수 있다.
+L1·L2가 같은 스크립트를 쓴다. 운영자 경로 그대로(make build → `vantage-5G load` → `./setup.sh` → set → iperf3 → killswitch → `./detach.sh` → unload)를 실행하고, 결과 디렉토리에 `summary.txt`(PASS/FAIL/SKIP), 단계별 `.log`, iperf3 JSON, `spec.csv`, `verdict.txt`, `stats_*.txt`를 남긴다. 토폴로지는 `testbed/netns-topo.sh`(UE netns 2개 → core netns(UPF 역할) → N6 veth `vt-n6` → 서비스 노드). `VT_NAT=1`이면 Open5GS 레퍼런스처럼 MASQUERADE를 걸어 "UE IP가 안 보이는" 실패 모드를 재현한다. `VT_NETEM="delay 10ms rate 200mbit"`로 무선 구간을 흉내 낼 수 있다. `VT_SETUP_AS=ubuntu`면 setup.sh/detach.sh를 NOPASSWD sudo 사용자로 실행(D21), `VT_NO_BPFTOOL=1`이면 setup.sh에서 bpftool을 숨겨 프로브 경로를 강제한다(`setup.sh-used-probe`로 확인). 비root 단계 `setup.sh-nonroot`(사용자 `VT_NONROOT_USER`, 기본 ubuntu)와 `setup.sh-ingress-refused`(D22)는 fq가 있으면 항상 돈다. l2-vbox.sh는 이 변수들을 VM으로 넘기고 결과를 `_workspace/l2-<release>-<ts>/`에 둔다.
 
 테스트 스크립트를 고치는 것은 이 스킬의 소유다. 제품 코드 결함을 테스트에서 우회하지 않는다 — 예: 스크립트 실행권한이 없으면 `bash setup.sh`로 돌리지 말고 FAIL로 남긴다(물리 서버에서도 똑같이 실패하므로).
 

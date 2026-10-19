@@ -1,7 +1,8 @@
 #cloud-config
-# vantage-svc: L2 service-node VM (stock Ubuntu kernel => sch_fq available).
-# @SSH_PUBKEY@ is substituted by testbed/l2-vbox.sh.
-hostname: vantage-svc
+# L2 service-node VM (stock Ubuntu kernel => sch_fq available), noble or jammy.
+# @SSH_PUBKEY@ and @HOSTNAME@ are substituted by testbed/l2-vbox.sh.
+# jammy: /usr/sbin/bpftool is a wrapper that needs linux-tools-$(uname -r) (runcmd).
+hostname: @HOSTNAME@
 users:
   - name: ubuntu
     sudo: ALL=(ALL) NOPASSWD:ALL
@@ -20,6 +21,8 @@ packages:
   - pkg-config
   - linux-tools-common
   - linux-tools-generic
+  - iputils-ping
+  - curl
   - iproute2
   - iptables
   - iperf3
