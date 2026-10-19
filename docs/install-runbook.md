@@ -171,8 +171,8 @@ DL 응답이 Vantage가 붙은 `<IF>`로 나가야 TX 페이서와 killswitch가
 
 ### 3.2 load
 - 명령: `sudo ./target/release/vantage-5G load; echo rc=$?; sudo ./target/release/vantage-5G load; echo rc=$?; sudo ls /sys/fs/bpf /sys/fs/bpf/vantage; for m in rx_state_map tx_tstamp_map ue_stats_map ue_policy_map; do sudo bpftool map show pinned /sys/fs/bpf/vantage/$m; done; free -m`
-- 기대: 두 번 모두 rc=0(두 번째는 `already pinned, skipping load`). `/sys/fs/bpf/vantage`에 프로그램 2개와 맵 4개가 있다. 맵 타입은 `lru_hash` 3개(`max_entries 16384`), `ue_policy_map`은 `hash`(`max_entries 1024`)이다. LRU 3개는 load 시 전량 사전 할당되며 `memlock` 합계는 24.04(6.8)에서 약 4.5 MiB(로컬 4,721,856 B), 22.04(5.15)에서는 커널의 계산 방식 차이로 약 1.5 MiB(로컬 1,572,864 B)로 표시된다(로컬 L2 `map-sizes-d25` 단계 기록, README §3.1). 이 값을 기록한다.
-- 실패 시: 2장(업그레이드)으로 간다. 출력 전체를 보고한다.
+- 기대: 두 번 모두 rc=0, 첫 줄은 `[i] BPF objects from <저장소 절대 경로>`(두 번째 실행은 이어서 `already pinned, skipping load`). `/sys/fs/bpf/vantage`에 프로그램 2개와 맵 4개가 있다. 맵 타입은 `lru_hash` 3개(`max_entries 16384`), `ue_policy_map`은 `hash`(`max_entries 1024`)이다. LRU 3개는 load 시 전량 사전 할당되며 `memlock` 합계는 24.04(6.8)에서 약 4.5 MiB(로컬 4,721,856 B), 22.04(5.15)에서는 커널의 계산 방식 차이로 약 1.5 MiB(로컬 1,572,864 B)로 표시된다(로컬 L2 `map-sizes-d25` 단계 기록, README §3.1). 이 값을 기록한다.
+- 실패 시: `pinned maps … do not match the object`이면 2장(업그레이드)으로 간다. `Error: BPF object files not found`이면 위에 나열된 디렉터리별 누락 파일을 보고 3.1(`make build`)을 확인한다(`load`는 `<exe>/../..`(저장소) → exe 디렉터리 → 현재 디렉터리(최후) 순으로 두 .o를 찾고, `--obj-dir <DIR>`이면 그 디렉터리만 본다. README §12.3). 출력 전체를 보고한다.
 
 ### 3.3 setup.sh (재실행 포함)
 - 명령: `sudo ./setup.sh <IF>; echo rc=$?; sudo ./setup.sh <IF>; echo rc=$?; ip -d link show dev <IF>; tc qdisc show dev <IF>; tc filter show dev <IF> egress`

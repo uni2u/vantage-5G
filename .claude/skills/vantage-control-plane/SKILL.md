@@ -53,5 +53,5 @@ Ubuntu 기본 `kernel.unprivileged_bpf_disabled=2`, `/sys/fs/bpf` 0700 → `set/
 - 인터페이스 이름은 인자로만 받는다. 하드코딩 금지.
 
 ### 신규 운영 자산
-- systemd: `vantage-5g-load.service`(oneshot, `ExecStart=… load`, `RemainAfterExit=yes`, `After=sys-fs-bpf.mount`) + attach용 템플릿 유닛 `vantage-5g-attach@<iface>.service`. 바이너리·`.o` 경로는 `WorkingDirectory`로 고정(현재 `load`는 `.o`를 상대경로로 연다).
+- systemd: `vantage-5g-load.service`(oneshot, `ExecStart=… load`, `RemainAfterExit=yes`, `After=sys-fs-bpf.mount`) + attach용 템플릿 유닛 `vantage-5g-attach@<iface>.service`. `load`는 `.o`를 `<binary dir>/../..`(심볼릭 링크 해석) → 바이너리 디렉터리 → 현재 디렉터리(최후) 순으로 찾으므로 `WorkingDirectory`는 선택; 바이너리를 저장소 밖으로 복사 설치하면 `--obj-dir`를 지정.
 - Grafana: `dashboards/vantage-5g.json`, README §7의 PromQL을 패널로 사용, `ue_ip` 템플릿 변수.
