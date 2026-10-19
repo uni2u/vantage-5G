@@ -126,7 +126,7 @@ These `iptables` commands are not persistent; see "Making (1) and (2) survive a 
 
 ```bash
 # on the UPF host
-sysctl net.ipv4.ip_forward                    # must print 1
+sysctl net.ipv4.ip_forward                    # must print 1 (the quickstart sets it with sysctl -w: lost on reboot)
 echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/90-ue-forward.conf
 sudo sysctl --system
 sudo iptables -S FORWARD | head -1            # "-P FORWARD DROP" (e.g. Docker installed) needs explicit accepts:
@@ -400,10 +400,10 @@ Assumption: two UEs registered through UERANSIM (UE-A, UE-B), Vantage loaded and
 
 ### 8.1 Find the UE addresses (UE host)
 
-UERANSIM's `nr-ue` creates one TUN interface per PDU session, `uesimtun0`, `uesimtun1`, … whose address is the UE IP the core assigned.
+UERANSIM's `nr-ue` creates one TUN interface per PDU session, `uesimtun0`, `uesimtun1`, … whose address is the UE IP the core assigned. The prefix length shown (`/24` with UERANSIM's default `tunNetmask`) is a local setting of the UE host; the UE IP is the address alone, which is what `set --ue-ip` takes. An Open5GS reference install hands out `10.45.0.2`, `10.45.0.3`, … in registration order.
 
 ```bash
-ip -br -4 addr show | grep uesimtun          # e.g. "uesimtun0  UNKNOWN  10.45.0.2/32"
+ip -br -4 addr show | grep uesimtun          # e.g. "uesimtun0  UNKNOWN  10.45.0.2/24"
 ip -4 addr show uesimtun0
 ```
 
@@ -443,7 +443,7 @@ iperf3 -c $SVC -B $UE_B -p 5204 -t 30 -R -J > b_dl.json &   # DL — expect ~5 M
 wait
 ```
 
-If `ip route get … from <UE_IP>` in 8.1 did not print `dev uesimtunN`, use UERANSIM's `nr-binder` helper (in UERANSIM's `build/` directory), which runs a program with its sockets bound to the given UE address:
+If `ip route get … from <UE_IP>` in 8.1 did not print `dev uesimtunN`, use UERANSIM's `nr-binder` helper (in UERANSIM's `build/` directory), which runs a program with its sockets bound to the given UE address. Run it from `build/`: it preloads `./libdevbnd.so` by a relative path.
 
 ```bash
 cd ~/UERANSIM/build
@@ -825,7 +825,7 @@ The repository carries a local test harness so that changes can be checked befor
 | L0 | any host with Python 3 | `python3 .claude/skills/vantage-boundary-check/scripts/contract_check.py .` | Static consistency: BPF C structs ↔ Rust, map/program names, pin paths, metrics ↔ this README |
 | L1 | Docker (privileged Ubuntu 24.04 container) | `./testbed/l1-docker.sh` | Build, verifier, `load`/`unload`, attach, uplink policing, killswitch, `reset`, upgrade paths. No `sch_fq` in Docker Desktop: `setup.sh` and downlink pacing are skipped |
 | L2 | VirtualBox Ubuntu VM (24.04 or 22.04) | `./testbed/l2-vbox.sh`, `VT_RELEASE=jammy ./testbed/l2-vbox.sh` | Everything in L1 plus `setup.sh` (also `--xdp-mode native` and a multi-queue N6 with `VT_N6_TXQ`) and §8's four concurrent sessions on an emulated N6 |
-| L3 | Open5GS + UERANSIM VMs | not built yet | Real UE addresses through a 5G core |
+| L3 | Open5GS + UERANSIM VM and the L2 service VM | `./testbed/l3-vbox.sh up`, `./testbed/l3-vbox.sh test` | Real UE addresses through a 5G core: the quickstart NAT failure, §3.2 (1) both methods, (2) with a `FORWARD ACCEPT` policy, (3) with `ip route add`, the end-to-end check, §8 with `iperf3 -B <UE IP>`, killswitch. Not exercised: making (1)–(3) persistent (ufw / `iptables-persistent` / netplan) and the `FORWARD DROP` case |
 | L4 | physical server | [`docs/install-runbook.md`](docs/install-runbook.md) | Real NIC, driver and core |
 
 One-off commands in the dev container: `./testbed/dev.sh 'make build'`.

@@ -14,7 +14,7 @@ description: "Vantage-5G 로컬 테스트 실행과 물리 서버 설치 준비.
 | L0 | macOS 호스트 | `python3 .claude/skills/vantage-boundary-check/scripts/contract_check.py .` | C↔Rust↔스크립트↔README 계약 | 실행 전부 |
 | L1 | Docker Desktop (커널 linuxkit, 특권 컨테이너) | `./testbed/l1-docker.sh` | build, verifier, `load`/핀, 멱등 load, attach, UL RX 셰이핑(동시 2세션), killswitch, reset, detach/unload 잔존물 | **sch_fq 없음** → setup.sh, DL EDT 페이싱 SKIP |
 | L2 | VirtualBox Ubuntu VM: `VT_RELEASE=noble`(기본, 24.04, `vantage-svc`, SSH :2522) / `jammy`(22.04, iproute2 5.15, `vantage-svc-jammy`, SSH :2523) | `[VT_RELEASE=jammy] ./testbed/l2-vbox.sh` | L1 전부 + setup.sh(재실행·비root·ingress 거부 포함) + DL 페이싱 + README §8 4세션 동시. 지원 OS 둘 다 돌린다 | 실제 5G 경로, 물리 NIC |
-| L3 | VirtualBox VM 2대 (core: Open5GS+UERANSIM, svc: Vantage) | (구축 예정 — 아래) | 실제 UE IP가 N6에 보이는지(NAT), GTP 경로 뒤의 셰이핑 | 물리 NIC native XDP |
+| L3 | VirtualBox VM 2대: `vantage-core`(jammy, Open5GS 2.8 레퍼런스 설치 + UERANSIM v3.2.7, gNB·UE 2대는 netns `ran`, SSH :2524) + `vantage-svc`(L2 noble VM에 NIC2 추가), N6 = intnet `vantage-n6` 10.200.0.1↔10.200.0.2 | `./testbed/l3-vbox.sh up` → `./testbed/l3-vbox.sh test` (`ssh-core`/`ssh-svc`/`down`/`delete`) | (a) quickstart MASQUERADE면 N6에 UPF IP만 보이고 정책 불일치, (b) README §3.2 (1) A·B안·(2)·(3)·종단 확인을 문서 명령 그대로, §8 4세션(`iperf3 -B <UE IP>`, counter+iperf 판정), killswitch, DL UDP/커널 fq 대조. 결과 `_workspace/l3-<ts>/` | 물리 NIC native XDP·하드웨어 큐, UERANSIM 용량(세션당 수십 Mbps) 이상의 처리량. virtio NIC에서 로컬 TCP DL은 어떤 셰이퍼든 cap 미달(환경, testbed/README §10) |
 | L4 | 물리 서버 | `_workspace/05_install_runbook.md` (사용자 실행) | 실제 NIC·드라이버·실 Core | — |
 
 빠른 단건 실험: `./testbed/dev.sh '<cmd>'` — 저장소 사본에서 명령 실행(예: `'make build'`, `'bpftool prog loadall vantage_tx_pacer.o /sys/fs/bpf/t type tc'`).
@@ -60,8 +60,8 @@ L1~L3을 통과한 커밋에 대해서만 작성한다. 각 단계는 `명령 / 
 ## 모드 D — README 동기화
 코드에서 확인한 사실만 쓴다(clap 정의, `opts!` 메트릭, 스크립트 동작). 수정 후 `contract_check.py` C7 PASS 확인. `history.md`, `README_old.md`는 건드리지 않는다.
 
-## L3 구축 계획 (미구현)
-- `vantage-core` VM: Open5GS(레퍼런스 설치, ogstun 10.45.0.0/16) + UERANSIM gNB/UE 2대. N6 라우팅으로 `vantage-svc`에 도달.
-- `vantage-svc` VM: L2와 동일.
-- 시나리오: (a) 레퍼런스 그대로(MASQUERADE) → 정책 불일치 확인, (b) 서비스 대역 NAT 제외 → README §8 측정.
-- 구축 시 이 절을 실제 스크립트 경로로 교체한다.
+## L3 (구축됨 — testbed/README §5a)
+- 스크립트: `testbed/l3-vbox.sh`, `testbed/vbox/{vm-lib.sh,core-user-data.tmpl,core-provision.sh,core-ran.sh,l3-test.sh}`. L2 VM 생성 로직은 `vm-lib.sh`로 공유(`l2-vbox.sh` 사용법 불변).
+- UE IP: Open5GS 레퍼런스는 등록 순서대로 10.45.0.2, 10.45.0.3. `uesimtunN`은 `/24`(UERANSIM 기본 tunNetmask)로 보인다.
+- 처리량 미달 분류: `b-dl-udp-pacer-control`(UDP DL counter ±10%)와 `b-dl-kernel-fq-control`(같은 NIC의 커널 fq maxrate)을 근거로 쓴다. 커널 셰이퍼 대조는 `tc qdisc replace … root fq maxrate X` 후 **`replace root fq`로는 maxrate가 남는다** — `tc qdisc del dev <IF> root` 후 `./setup.sh <IF>`로 복구.
+- 수동 조작: `./testbed/l3-vbox.sh ssh-core`에서 `sudo bash ~/core-ran.sh status|ues|up|down|nat-reference`.
