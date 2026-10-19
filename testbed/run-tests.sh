@@ -495,7 +495,8 @@ upgrade() {
     done
     [[ ${variant} == hash ]] && oldtype=hash || oldtype=lru_hash
     echo "--- old build (${variant}): load + attach + set"
-    (cd "${od}" && "${CLI}" load) || return 1
+    # cwd is searched last (5th round, M-D1), so name the old build explicitly.
+    "${CLI}" load --obj-dir "${od}" || return 1
     "${BPFTOOL}" map show pinned /sys/fs/bpf/vantage/rx_state_map | tr '\n' ' ' | grep -qE "^[0-9]+: ${oldtype} .*max_entries 1024 " \
         || { echo "old rx_state_map not ${oldtype}/1024"; return 1; }
     attach || return 1

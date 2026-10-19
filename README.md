@@ -242,7 +242,7 @@ Makefile targets: `make check` (prints `OK: all required tools and BTF are avail
 
 ## 5. Bootstrap — one-time load and attach
 
-Do these in order on the **service node**, from the repository directory (`load` opens `vantage_rx_policer.o` and `vantage_tx_pacer.o` from the **current directory**; run elsewhere it fails with `libbpf: elf: failed to open vantage_rx_policer.o: -ENOENT`).
+Do these in order on the **service node**. `load` needs `vantage_rx_policer.o` and `vantage_tx_pacer.o` from `make build`; it takes them from the first of these directories that holds **both**: the repository root of the executable (`<exe dir>/../..`, i.e. the checkout when you run `<repo>/target/release/vantage-5G` or a symlink to it), the executable's own directory, and only as a last resort the current directory (so `.o` files lying in the directory you happen to run it from, e.g. `/tmp` or an older checkout, never take precedence over the ones built with the binary). So `load` works from any directory as long as the binary stays in `<repo>/target/release/`. If you copied the binary elsewhere, put the two `.o` files next to it or pass `--obj-dir <DIR>` (that directory only, no search). The first output line names the directory used (`[i] BPF objects from /home/ops/vantage-5g`).
 
 ```bash
 # 1) Load & pin BPF programs and maps into /sys/fs/bpf/vantage/.
@@ -310,14 +310,17 @@ Output of each command: §12.
 ## 7. Monitor — Prometheus exporter
 
 ```bash
-sudo ./target/release/vantage-5G monitor           # binds :9090
+sudo ./target/release/vantage-5G monitor           # binds 0.0.0.0:9090
 # or a different port:
 sudo ./target/release/vantage-5G monitor --port 9191
 # scrape the BPF maps every 5 s instead of every 1 s:
 sudo ./target/release/vantage-5G monitor --scrape-ms 5000
+# listen on localhost only (or one interface address; IPv6 e.g. ::1; :: = all IPv6 addresses,
+# and IPv4 too while sysctl net.ipv6.bindv6only=0, the Linux default):
+sudo ./target/release/vantage-5G monitor --bind 127.0.0.1
 ```
 
-The exporter runs in the foreground, listens on **all addresses** (`0.0.0.0:<port>`) and serves `http://<host>:<port>/metrics`. Restrict access with a firewall if the node is reachable from untrusted networks. Quick check: `curl -s localhost:9090/metrics | grep '^vantage_'`.
+The exporter runs in the foreground and serves `http://<bind>:<port>/metrics`. By default it listens on **all IPv4 addresses** (`--bind 0.0.0.0`); `--bind` takes one IPv4 or IPv6 address (no hostname, no CIDR). `--port` accepts `1..=65535`, `--scrape-ms` (time between BPF map reads) `100..=60000`; anything else is rejected with exit 2. If you keep the default bind, restrict access with a firewall when the node is reachable from untrusted networks. Quick check: `curl -s localhost:9090/metrics | grep '^vantage_'`.
 
 Exposed series (all labeled with `ue_ip`):
 
@@ -510,7 +513,7 @@ sudo ./target/release/vantage-5G unload         # remove pinned programs & maps
 
 **`open pinned ue_policy_map (run `vantage-5G load` first; needs root)`** — the CLI can't open the pinned map: either nothing is loaded (run `sudo ./target/release/vantage-5G load`, once per boot) or the command was run without `sudo`.
 
-**`load` fails with `libbpf: elf: failed to open vantage_rx_policer.o: -ENOENT`** — `load` was run outside the repository directory, or before `make build`. `cd` into the repository and run it as `sudo ./target/release/vantage-5G load`.
+**`load` fails with `Error: BPF object files not found`** — none of the searched directories holds both `.o` files; the lines above the error list every directory tried, in search order (`<exe dir>/../..`, the executable's directory, the current directory), and which file is missing in each. Usually `make build` was not run (or only `make rust`), or the binary was copied out of `<repo>/target/release/` without the `.o` files. Run `make build`, or pass the directory explicitly: `sudo vantage-5G load --obj-dir /path/to/objs` (§5).
 
 **`setup.sh` exits 2 with `bpftool is not usable`** — install `linux-tools-$(uname -r)` (§3); `bpftool version` must work.
 
@@ -540,7 +543,7 @@ sudo ./target/release/vantage-5G set --ue-ip ... --rx-mbps ... --tx-mbps ...   #
 
 **`set` fails with `update ue_policy_map for … Argument list too long (os error 7)`** — the policy map is full (1024 UEs, §3.1). `reset` UEs that no longer need a policy; updating a UE that already has one still works.
 
-**`monitor` fails with `can not start http server: Address already in use`** — another process (often a second `monitor`) holds the port; pick another with `--port`.
+**`monitor` fails with `can not start http server: Address already in use`** — another process (often a second `monitor`) holds the port on that address; pick another with `--port`. A `--bind` address that is not configured on the host fails the same way with `Cannot assign requested address`.
 
 **`ue_policy_map`, `ue_stats_map`, `rx_state_map` or `tx_tstamp_map` directly under `/sys/fs/bpf`** — left by a build older than the `/sys/fs/bpf/vantage/` layout; `unload` only cleans `/sys/fs/bpf/vantage/`. After `detach.sh` + `unload`, remove them with `sudo rm -f /sys/fs/bpf/{ue_policy_map,ue_stats_map,rx_state_map,tx_tstamp_map}`.
 
@@ -602,7 +605,7 @@ Options:
 |---|---|---|
 | `0` | Success (also `--help`, `--version`). | stdout |
 | `1` | Runtime error: pins missing, not root, map full, load refused, unload refused, port in use, … | `Error: <what>` and `Caused by:` lines on stderr |
-| `2` | Argument error (unknown option or subcommand, missing required option, value out of range, bad IPv4 address). | `error: …` on stderr, e.g. `error: invalid value '…' for '--…'` or `error: the following required arguments were not provided:`, always followed by `For more information, try '--help'.` |
+| `2` | Argument error (unknown option or subcommand, missing required option, value out of range, malformed IP address). | `error: …` on stderr, e.g. `error: invalid value '…' for '--…'` or `error: the following required arguments were not provided:`, always followed by `For more information, try '--help'.` |
 
 ### 12.2 Options
 
@@ -613,27 +616,59 @@ Options:
 | `set` | `--tx-mbps <TX_MBPS>` | integer `0..=400000`; `0` = downlink killswitch | — | yes |
 | `reset` | `--ue-ip <UE_IP>` | IPv4 address | — | yes |
 | `stats` | `--ue-ip <UE_IP>` | IPv4 address | all UEs | no |
-| `monitor` | `--port <PORT>` | `0..=65535`. Use `1..=65535`: `0` binds a random free port that is not reported (the banner prints `:0`) | `9090` | no |
-| `monitor` | `--scrape-ms <SCRAPE_MS>` | milliseconds between map reads, any `u64`. Use ≥ 100: `0` is accepted and makes the loop spin at 100% CPU | `1000` | no |
+| `load` | `--obj-dir <DIR>` | directory holding both `vantage_rx_policer.o` and `vantage_tx_pacer.o`; only this directory is used (no search) | search: `<exe dir>/../..` → exe dir → current dir (§12.3) | no |
+| `monitor` | `--bind <BIND>` | one IPv4 or IPv6 address (`127.0.0.1`, `::1`, `::`); no hostname, no CIDR, no IPv6 zone id (`fe80::1%eth0` is rejected; use a global/ULA address or `::`) | `0.0.0.0` | no |
+| `monitor` | `--port <PORT>` | integer `1..=65535` | `9090` | no |
+| `monitor` | `--scrape-ms <SCRAPE_MS>` | milliseconds between map reads, `100..=60000` | `1000` | no |
 
-`load`, `unload` and `list` take no options.
+`unload` and `list` take no options. Out-of-range or malformed values exit 2, e.g. `error: invalid value '0' for '--port <PORT>': 0 is not in 1..=65535`, `error: invalid value '50' for '--scrape-ms <SCRAPE_MS>': 50 is not in 100..=60000`, `error: invalid value '10.0.0.0/8' for '--bind <BIND>': invalid IP address syntax`.
 
 ### 12.3 `load`
 
-Opens `vantage_rx_policer.o` and `vantage_tx_pacer.o` **from the current directory**, loads them and pins programs and maps under `/sys/fs/bpf/vantage/` (`vantage_rx_policer`, `vantage_tx_pacer`, `ue_policy_map`, `ue_stats_map`, `rx_state_map`, `tx_tstamp_map`). Idempotent: an already pinned program is skipped. Before that, every map already pinned is compared with the object's definition; a difference refuses the load (exit 1, nothing changed).
+```
+$ ./target/release/vantage-5G load --help
+Load & pin the RX/TX BPF objects (idempotent). Programs remain in the kernel after this command exits; use setup.sh to attach them to an iface.
+
+Without --obj-dir the .o files are searched in: the repository root of the executable (<exe dir>/../..), the executable's directory, the current directory (last).
+
+Usage: vantage-5G load [OPTIONS]
+
+Options:
+      --obj-dir <DIR>
+          Directory holding vantage_rx_policer.o and vantage_tx_pacer.o (no search)
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+Opens `vantage_rx_policer.o` and `vantage_tx_pacer.o` from `--obj-dir`, or else from the first directory that holds both of them, searched in this order: `<exe dir>/../..` (the repository root when the binary is `<repo>/target/release/vantage-5G`; the executable path is resolved through symlinks, so `/usr/local/bin/vantage-5G -> <repo>/target/release/vantage-5G` finds `<repo>`), the executable's directory, and last the current directory (listed once if it is one of the first two). The current directory comes last so that running `load` as root from an untrusted directory or an older checkout cannot load other `.o` files than the binary's own; use `--obj-dir .` to load the current directory's objects on purpose. It then loads them and pins programs and maps under `/sys/fs/bpf/vantage/` (`vantage_rx_policer`, `vantage_tx_pacer`, `ue_policy_map`, `ue_stats_map`, `rx_state_map`, `tx_tstamp_map`). Idempotent: an already pinned program is skipped. Before that, every map already pinned is compared with the object's definition; a difference refuses the load (exit 1, nothing changed).
 
 ```
 $ sudo ./target/release/vantage-5G load
+[i] BPF objects from /home/ops/vantage-5g
 [+] loaded vantage_rx_policer and pinned to /sys/fs/bpf/vantage/vantage_rx_policer
 [+] loaded vantage_tx_pacer and pinned to /sys/fs/bpf/vantage/vantage_tx_pacer
 [+] Vantage-5G loaded. Pins under /sys/fs/bpf/vantage
     Attach with: sudo ./setup.sh <iface>
 
 $ sudo ./target/release/vantage-5G load          # second time
+[i] BPF objects from /home/ops/vantage-5g
 [i] vantage_rx_policer already pinned, skipping load.
 [i] vantage_tx_pacer already pinned, skipping load.
 [+] Vantage-5G loaded. Pins under /sys/fs/bpf/vantage
     Attach with: sudo ./setup.sh <iface>
+```
+
+Objects not found (exit 1, nothing pinned, `/sys/fs/bpf/vantage` not created):
+
+```
+$ cd /tmp && sudo /opt/vantage/vantage-5G load    # binary copied without the .o files
+[-] vantage_rx_policer.o and vantage_tx_pacer.o not found together in:
+      /  (missing: vantage_rx_policer.o, vantage_tx_pacer.o)
+      /opt/vantage  (missing: vantage_rx_policer.o, vantage_tx_pacer.o)
+      /tmp  (missing: vantage_rx_policer.o, vantage_tx_pacer.o)
+    build them with `make build`, or pass --obj-dir <DIR>
+Error: BPF object files not found
 ```
 
 Refused upgrade (pins from an older build, exit 1): `[-] vantage_rx_policer.o: pinned maps under /sys/fs/bpf/vantage do not match the object:`, one line per map such as `rx_state_map (pinned -> .o): max_entries 1024 -> 16384`, and the upgrade procedure (§10).
@@ -704,7 +739,20 @@ Empty maps print `(no policies configured)` and `(no stats yet — is traffic fl
 
 ### 12.8 `monitor`
 
-Foreground Prometheus exporter on `0.0.0.0:<port>/metrics` (metrics: §7). It never exits on scrape errors (e.g. started before `load`); it logs each distinct error once and retries every `--scrape-ms`.
+```
+$ ./target/release/vantage-5G monitor --help
+Run the Prometheus exporter (foreground). Scrapes pinned stats maps
+
+Usage: vantage-5G monitor [OPTIONS]
+
+Options:
+      --bind <BIND>            Address to listen on (IPv4 or IPv6, e.g. 127.0.0.1, ::1, ::) [default: 0.0.0.0]
+      --port <PORT>            [default: 9090]
+      --scrape-ms <SCRAPE_MS>  Milliseconds between BPF map reads [default: 1000]
+  -h, --help                   Print help
+```
+
+Foreground Prometheus exporter on `<bind>:<port>/metrics` (default `0.0.0.0:9090`; metrics: §7). The banner prints the address actually bound (an IPv6 address in brackets, e.g. `http://[::1]:9090/metrics`). It never exits on scrape errors (e.g. started before `load`); it logs each distinct error once and retries every `--scrape-ms`.
 
 ```
 $ sudo ./target/release/vantage-5G monitor
@@ -716,7 +764,7 @@ $ sudo ./target/release/vantage-5G monitor
 
 The last two lines appear only when `monitor` was started before `load` (or across an `unload`/`load`).
 
-It exits (code 1) only when the HTTP server cannot start: `Error: start Prometheus exporter on 0.0.0.0:<port>` / `can not start http server: Address already in use (os error 98)`. Stop it with Ctrl-C.
+It exits (code 1) only when the HTTP server cannot start: `Error: start Prometheus exporter on <bind>:<port>` / `can not start http server: Address already in use (os error 98)` (port taken) or `… Cannot assign requested address (os error 99)` (`--bind` address not configured on this host). Stop it with Ctrl-C.
 
 ### 12.9 `setup.sh` and `detach.sh`
 

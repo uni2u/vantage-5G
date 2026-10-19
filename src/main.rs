@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
 use std::mem::size_of;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -137,7 +137,13 @@ struct Cli {
 enum Cmd {
     /// Load & pin the RX/TX BPF objects (idempotent). Programs remain in the
     /// kernel after this command exits; use setup.sh to attach them to an iface.
-    Load,
+    ///
+    /// Without --obj-dir the .o files are searched in: the repository root of the
+    /// executable (<exe dir>/../..), the executable's directory, the current directory (last).
+    Load {
+        /// Directory holding vantage_rx_policer.o and vantage_tx_pacer.o (no search)
+        #[arg(long, value_name = "DIR")] obj_dir: Option<PathBuf>,
+    },
 
     /// Remove all Vantage pins. Refuses while a Vantage program is still
     /// attached to an interface in this network namespace (run detach.sh first).
@@ -166,32 +172,86 @@ enum Cmd {
 
     /// Run the Prometheus exporter (foreground). Scrapes pinned stats maps.
     Monitor {
-        #[arg(long, default_value_t = 9090)] port: u16,
-        #[arg(long, default_value_t = 1000)] scrape_ms: u64,
+        /// Address to listen on (IPv4 or IPv6, e.g. 127.0.0.1, ::1, ::)
+        #[arg(long, default_value_t = IpAddr::V4(Ipv4Addr::UNSPECIFIED))] bind: IpAddr,
+        #[arg(long, default_value_t = 9090,
+              value_parser = clap::value_parser!(u16).range(1..=65535))] port: u16,
+        /// Milliseconds between BPF map reads
+        #[arg(long, default_value_t = 1000,
+              value_parser = clap::value_parser!(u64).range(100..=60000))] scrape_ms: u64,
     },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Load                                => cmd_load(),
+        Cmd::Load { obj_dir }                    => cmd_load(obj_dir),
         Cmd::Unload                              => cmd_unload(),
         Cmd::Set { ue_ip, rx_mbps, tx_mbps }     => cmd_set(ue_ip, rx_mbps, tx_mbps),
         Cmd::Reset { ue_ip }                     => cmd_reset(ue_ip),
         Cmd::List                                => cmd_list(),
         Cmd::Stats { ue_ip }                     => cmd_stats(ue_ip),
-        Cmd::Monitor { port, scrape_ms }         => cmd_monitor(port, scrape_ms),
+        Cmd::Monitor { bind, port, scrape_ms }   => cmd_monitor(bind, port, scrape_ms),
     }
 }
 
 // ---------- load / unload ----------
-fn cmd_load() -> Result<()> {
+fn cmd_load(obj_dir: Option<PathBuf>) -> Result<()> {
+    let dir = find_obj_dir(obj_dir)?;
+    println!("[i] BPF objects from {}", dir.display());
     ensure_pin_dir()?;
-    load_and_pin(OBJ_RX, PROG_RX_NAME)?;
-    load_and_pin(OBJ_TX, PROG_TX_NAME)?;
+    load_and_pin(&dir, OBJ_RX, PROG_RX_NAME)?;
+    load_and_pin(&dir, OBJ_TX, PROG_TX_NAME)?;
     println!("[+] Vantage-5G loaded. Pins under {}", BPF_PIN_DIR);
     println!("    Attach with: sudo ./setup.sh <iface>");
     Ok(())
+}
+
+/// Directory that holds both OBJ_RX and OBJ_TX (M1). An explicit --obj-dir is
+/// the only candidate; otherwise: the repository root of the executable
+/// (target/release/../..), the executable's own directory, and only then the
+/// current directory. The cwd comes last (QA M-D1) so that a root `load` run
+/// from an untrusted directory (/tmp) or an older checkout never prefers the
+/// .o files found there over the ones built with this binary.
+/// current_exe() is canonicalized so a symlink in e.g. /usr/local/bin resolves
+/// to the real binary under <repo>/target/release.
+fn find_obj_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    let mut cands: Vec<PathBuf> = Vec::new();
+    if let Some(d) = explicit {
+        cands.push(d);
+    } else {
+        match std::env::current_exe().and_then(|p| p.canonicalize()) {
+            Ok(exe) => {
+                if let Some(exe_dir) = exe.parent() {
+                    if let Some(root) = exe_dir.parent().and_then(Path::parent) {
+                        cands.push(root.to_path_buf());
+                    }
+                    cands.push(exe_dir.to_path_buf());
+                }
+            }
+            Err(e) => eprintln!("[!] cannot resolve the executable path ({}); searching the current directory only", e),
+        }
+        // Last resort; skipped when it is one of the directories above.
+        let cwd = PathBuf::from(".");
+        let cwd_abs = cwd.canonicalize().ok();
+        if cwd_abs.is_none() || !cands.iter().any(|c| Some(c) == cwd_abs.as_ref()) {
+            cands.push(cwd);
+        }
+    }
+    let has_both = |d: &Path| d.join(OBJ_RX).is_file() && d.join(OBJ_TX).is_file();
+    if let Some(d) = cands.iter().find(|d| has_both(d)) {
+        // Absolute path for the messages; fall back to the path as given.
+        return Ok(d.canonicalize().unwrap_or_else(|_| d.clone()));
+    }
+    eprintln!("[-] {} and {} not found together in:", OBJ_RX, OBJ_TX);
+    for d in &cands {
+        let shown = d.canonicalize().unwrap_or_else(|_| d.clone());
+        let missing: Vec<&str> = [OBJ_RX, OBJ_TX].into_iter()
+            .filter(|f| !d.join(f).is_file()).collect();
+        eprintln!("      {}  (missing: {})", shown.display(), missing.join(", "));
+    }
+    eprintln!("    build them with `make build`, or pass --obj-dir <DIR>");
+    bail!("BPF object files not found");
 }
 
 const UPGRADE_HINT: &str = "upgrade procedure (map definitions changed in the .o):\n      \
@@ -428,7 +488,7 @@ fn pinned_map_mismatches(open: &OpenObject) -> Result<Vec<String>> {
     Ok(out)
 }
 
-fn load_and_pin(obj_file: &str, prog_name: &str) -> Result<()> {
+fn load_and_pin(dir: &Path, obj_file: &str, prog_name: &str) -> Result<()> {
     // All maps in both objects are declared LIBBPF_PIN_BY_NAME. With
     // pin_root_path set, libbpf computes each map's pin path at open time
     // as <BPF_PIN_DIR>/<map name>, and during load() either re-uses an
@@ -439,8 +499,8 @@ fn load_and_pin(obj_file: &str, prog_name: &str) -> Result<()> {
     let open = ObjectBuilder::default()
         .pin_root_path(BPF_PIN_DIR)
         .with_context(|| format!("pin_root_path {}", BPF_PIN_DIR))?
-        .open_file(obj_file)
-        .with_context(|| format!("open {}", obj_file))?;
+        .open_file(dir.join(obj_file))
+        .with_context(|| format!("open {}", dir.join(obj_file).display()))?;
 
     // A pinned map whose definition differs from the .o (e.g. HASH -> LRU_HASH)
     // makes libbpf fail with "couldn't reuse pinned map ... parameter
@@ -657,11 +717,13 @@ fn all_counters() -> [&'static CounterVec; 6] {
     [&M_RX_BYTES, &M_RX_PACKETS, &M_RX_DROPS, &M_TX_BYTES, &M_TX_PACKETS, &M_TX_DROPS]
 }
 
-fn cmd_monitor(port: u16, scrape_ms: u64) -> Result<()> {
-    let bind: std::net::SocketAddr = format!("0.0.0.0:{}", port).parse()?;
+fn cmd_monitor(ip: IpAddr, port: u16, scrape_ms: u64) -> Result<()> {
+    // clap restricts port to 1..=65535, so the address printed below is the
+    // one actually bound (no ephemeral port 0).
+    let bind = SocketAddr::new(ip, port);
     prometheus_exporter::start(bind)
         .with_context(|| format!("start Prometheus exporter on {}", bind))?;
-    println!("[+] Prometheus exporter listening on http://0.0.0.0:{}/metrics", port);
+    println!("[+] Prometheus exporter listening on http://{}/metrics", bind);
     println!("    scraping BPF maps every {} ms (pins re-opened each scrape).  Ctrl-C to stop.", scrape_ms);
 
     let mut st = MonitorState::default();
