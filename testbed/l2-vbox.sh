@@ -103,7 +103,8 @@ OUT=${ROOT}/_workspace/l2-${REL}-${TS}
 mkdir -p "${OUT}"
 rsync -a --delete -e "ssh ${SSH_OPTS[*]}" --exclude target --exclude '_workspace*' --exclude .git \
     "${ROOT}/" ubuntu@127.0.0.1:work/ || exit 1
-git -C "${ROOT}" rev-parse --short HEAD > "${OUT}/commit.txt" 2>/dev/null || true
+# Tested tree: HEAD plus "-dirty" when tracked files have uncommitted changes.
+git -C "${ROOT}" describe --always --dirty > "${OUT}/commit.txt" 2>/dev/null || echo no-git > "${OUT}/commit.txt"
 echo "release=${REL} vm=${VM}" >> "${OUT}/commit.txt"
 PASS_ENV=""
 for v in VT_SETUP_AS VT_NONROOT_USER VT_NO_BPFTOOL VT_NAT VT_NETEM; do
