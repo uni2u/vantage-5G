@@ -15,6 +15,16 @@
 #                      cannot match — use it to demonstrate that failure mode.
 #   VT_NETEM="..."     netem args applied on the core's UE-facing links to mimic
 #                      the radio leg (e.g. "delay 10ms rate 200mbit").
+#   VT_N6_TXQ=<n>      TX/RX queue count of the N6 veth pair (default 1). n>=2
+#                      gives vt-n6 n TX queues so setup.sh builds root mq + one
+#                      fq per queue. Both ends get n TX and n RX queues: native
+#                      XDP on veth needs rx queues >= the peer's tx queues.
+#                      veth is IFF_NO_QUEUE, so its default root stays noqueue
+#                      (not mq) before setup.sh and after detach.sh.
+#   VT_N6_TXQ_MAX=<m>  allocated queues (numtxqueues/numrxqueues) of the N6 veth
+#                      pair, default = VT_N6_TXQ. m > n: created with m queues,
+#                      then `ethtool -L ... rx n tx n` on both ends, so the
+#                      active count can later grow up to m (setup.sh-txq-grow).
 
 set -eu
 
@@ -22,6 +32,11 @@ N6_IF=vt-n6
 SVC_IP=10.99.0.1
 CORE_IP=10.99.0.2
 UES="a:10.45.1.23 b:10.45.1.24"
+N6_TXQ=${VT_N6_TXQ:-1}
+[[ "${N6_TXQ}" =~ ^[1-9][0-9]*$ ]] || { echo "VT_N6_TXQ must be a positive integer (got '${N6_TXQ}')"; exit 1; }
+N6_TXQ_MAX=${VT_N6_TXQ_MAX:-${N6_TXQ}}
+[[ "${N6_TXQ_MAX}" =~ ^[1-9][0-9]*$ && ${N6_TXQ_MAX} -ge ${N6_TXQ} ]] \
+    || { echo "VT_N6_TXQ_MAX must be an integer >= VT_N6_TXQ (got '${N6_TXQ_MAX}')"; exit 1; }
 
 down() {
     ip link del "${N6_IF}" 2>/dev/null || true
@@ -36,7 +51,14 @@ up() {
     ip -n vt-core link set lo up
 
     # N6 link: service node <-> core
-    ip link add "${N6_IF}" type veth peer name vt-n6c
+    ip link add "${N6_IF}" numtxqueues "${N6_TXQ_MAX}" numrxqueues "${N6_TXQ_MAX}" type veth \
+        peer name vt-n6c numtxqueues "${N6_TXQ_MAX}" numrxqueues "${N6_TXQ_MAX}"
+    if [[ ${N6_TXQ_MAX} -gt ${N6_TXQ} ]]; then
+        ethtool -L "${N6_IF}" rx "${N6_TXQ}" tx "${N6_TXQ}" && ethtool -L vt-n6c rx "${N6_TXQ}" tx "${N6_TXQ}" \
+            || { echo "[-] ethtool -L on the N6 veth failed (needs ethtool and veth channel support)"; exit 1; }
+    fi
+    local nq; nq=$(ls -d /sys/class/net/"${N6_IF}"/queues/tx-* | wc -l)
+    [[ ${nq} -eq ${N6_TXQ} ]] || { echo "[-] ${N6_IF} has ${nq} TX queues, wanted ${N6_TXQ}"; exit 1; }
     ip link set vt-n6c netns vt-core
     ip addr add "${SVC_IP}/24" dev "${N6_IF}"
     ip link set "${N6_IF}" up
@@ -75,7 +97,7 @@ up() {
         ip netns exec "vt-ue-${name}" ping -c1 -W2 "${SVC_IP}" >/dev/null \
             || { echo "[-] UE-${name} cannot reach ${SVC_IP}"; exit 1; }
     done
-    echo "[+] topology up: N6 iface=${N6_IF} svc=${SVC_IP} UEs: ${UES}"
+    echo "[+] topology up: N6 iface=${N6_IF} (${N6_TXQ} of ${N6_TXQ_MAX} TX queues active) svc=${SVC_IP} UEs: ${UES}"
 }
 
 case "${1:-}" in

@@ -13,7 +13,8 @@
 # Release (README §3 supports both):
 #   VT_RELEASE=noble  (default) VM vantage-svc,       ssh 127.0.0.1:2522
 #   VT_RELEASE=jammy            VM vantage-svc-jammy, ssh 127.0.0.1:2523
-# Passed through to run-tests.sh: VT_SETUP_AS, VT_NONROOT_USER, VT_NO_BPFTOOL, VT_NAT, VT_NETEM.
+# Passed through to run-tests.sh: VT_SETUP_AS, VT_NONROOT_USER, VT_NO_BPFTOOL, VT_NAT, VT_NETEM,
+# VT_XDP_MODE, VT_N6_TXQ, VT_N6_TXQ_MAX.
 #
 # Provisioning: Ubuntu cloud image (vmdk -> vdi) + cloud-init NoCloud seed ISO.
 # Access: NAT port-forward 127.0.0.1:${VT_SSH_PORT} -> 22 with a dedicated key.
@@ -107,7 +108,7 @@ rsync -a --delete -e "ssh ${SSH_OPTS[*]}" --exclude target --exclude '_workspace
 git -C "${ROOT}" describe --always --dirty > "${OUT}/commit.txt" 2>/dev/null || echo no-git > "${OUT}/commit.txt"
 echo "release=${REL} vm=${VM}" >> "${OUT}/commit.txt"
 PASS_ENV=""
-for v in VT_SETUP_AS VT_NONROOT_USER VT_NO_BPFTOOL VT_NAT VT_NETEM; do
+for v in VT_SETUP_AS VT_NONROOT_USER VT_NO_BPFTOOL VT_NAT VT_NETEM VT_XDP_MODE VT_N6_TXQ VT_N6_TXQ_MAX; do
     [[ -n "${!v:-}" ]] && PASS_ENV+=" ${v}=$(printf %q "${!v}")"
 done
 

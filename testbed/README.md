@@ -25,7 +25,7 @@ The scripts were developed on a macOS (x86_64) host. `l2-vbox.sh` uses `hdiutil`
 |---|---|---|---|---|
 | **L0** | any host with Python 3.8+ | `python3 .claude/skills/vantage-boundary-check/scripts/contract_check.py .` | Static contracts: C struct ↔ Rust `#[repr(C)]`, map/program names, pin paths in `setup.sh`/`detach.sh`, Prometheus metric names ↔ top-level README. Exit 1 on any FAIL | Anything that runs |
 | **L1** | Docker (Docker Desktop kernel), privileged Ubuntu 24.04 container | `./testbed/l1-docker.sh` | Build, verifier, `load` (and idempotent re-load), attach, uplink RX policing with two concurrent sessions, killswitch, `set`/`reset` state handling, `unload` guard, `detach.sh` exit codes, upgrade from older pins | `sch_fq` is missing → `setup.sh`, downlink EDT pacing and the non-root / `ingress` checks are skipped |
-| **L2** | VirtualBox VM, stock Ubuntu 24.04 (`noble`, default) or 22.04 (`jammy`) | `./testbed/l2-vbox.sh` / `VT_RELEASE=jammy ./testbed/l2-vbox.sh` | All of L1 plus `setup.sh` (re-runs, re-run under load, non-root user, `ingress` refusal, missing `bpftool`), downlink pacing and the top-level README §8 four concurrent sessions | Real 5G path (GTP, UPF NAT), physical NIC, native XDP |
+| **L2** | VirtualBox VM, stock Ubuntu 24.04 (`noble`, default) or 22.04 (`jammy`) | `./testbed/l2-vbox.sh` / `VT_RELEASE=jammy ./testbed/l2-vbox.sh` | All of L1 plus `setup.sh` (re-runs without a hook gap, re-run under load, non-root user, `ingress` refusal, missing `bpftool`, `--xdp-mode` switching, multi-queue `mq` layout with `VT_N6_TXQ`), downlink pacing, the top-level README §8 four concurrent sessions and a 4-flow-per-UE downlink cap check | Real 5G path (GTP, UPF NAT), physical NIC and its driver's native XDP / hardware queues |
 | **L3** | Open5GS + UERANSIM VM and service VM | not built yet | Real UE addresses through a core, NAT on/off | Physical NIC |
 | **L4** | Physical Ubuntu server | [`docs/install-runbook.md`](../docs/install-runbook.md) (run by hand) | Real NIC, driver, multi-queue, real core | — |
 
@@ -62,7 +62,7 @@ T=30 ./testbed/l1-docker.sh
 ```
 
 - Same image, mounts and volumes as `dev.sh`; additionally mounts `_workspace/l1-<YYYYmmdd_HHMMSS>/` as `/results`, writes `commit.txt` there on the host (`git describe --always --dirty`, see §9) and runs `bash testbed/run-tests.sh` with `OUT=/results`.
-- Only `T` (default 15) is passed into the container. The `VT_*` variables of §6 are **not** forwarded by `l1-docker.sh`.
+- Passes `T` (default 15) and, when set on the host, `VT_SETUP_AS`, `VT_NONROOT_USER`, `VT_NO_BPFTOOL`, `VT_NAT`, `VT_NETEM`, `VT_XDP_MODE`, `VT_N6_TXQ` into the container (`docker run -e`). The container has no `ubuntu` user and no `sch_fq`, so the `setup.sh`-related variables have no visible effect there; `VT_XDP_MODE` selects the slot of the manual attach and `VT_N6_TXQ` the queue count of the topology.
 - Prints `L1 results: <dir>` and exits with `run-tests.sh`'s exit code (0 = no FAIL line in `summary.txt`).
 
 ## 5. `l2-vbox.sh` — L2 run in a VirtualBox Ubuntu VM
@@ -101,7 +101,7 @@ The VM keeps running after a test (the next run starts faster); `stop` it when d
 
 ## 6. Environment variables
 
-Read by the scripts shown; "→ VM" means `l2-vbox.sh` forwards it to `run-tests.sh` in the VM.
+Read by the scripts shown; "→ VM" means `l2-vbox.sh` forwards it to `run-tests.sh` in the VM. Every `VT_*` variable marked "→ VM" is also forwarded into the L1 container by `l1-docker.sh` (when set).
 
 | Variable | Default | Used by | Effect |
 |---|---|---|---|
@@ -116,6 +116,9 @@ Read by the scripts shown; "→ VM" means `l2-vbox.sh` forwards it to `run-tests
 | `VT_NAT` | `0` | `netns-topo.sh` → VM | `1` adds `iptables -t nat -A POSTROUTING -s 10.45.0.0/16 -o vt-n6c -j MASQUERADE` in the core namespace, like the Open5GS quickstart. The service node then sees only `10.99.0.2`, no policy matches and the verdicts **fail on purpose** — use it to see that failure mode |
 | `VT_NETEM` | empty | `netns-topo.sh` → VM | netem arguments applied as root qdisc on the core's UE-facing links to mimic the radio leg, e.g. `VT_NETEM="delay 10ms rate 200mbit"` |
 | `VT_NO_BPFTOOL` | `0` | `run-tests.sh` → VM | Accepted for compatibility and only recorded in `env.txt`. The missing-`bpftool` checks (`setup.sh-no-bpftool*`) run on every run anyway |
+| `VT_XDP_MODE` | unset (= `generic`) | `run-tests.sh` → VM | `generic` or `native` (anything else exits 1). Unset: every `setup.sh` call is the operator default `setup.sh vt-n6` (generic). Set: every call passes `--xdp-mode <mode>`, and the attach check expects that slot (`xdpgeneric` / `xdpdrv`). Without fq (L1) it selects the slot of the manual attach. `native` on `vt-n6` uses the veth driver's native XDP, not a physical NIC driver |
+| `VT_N6_TXQ` | `1` | `netns-topo.sh` → VM | Number of TX and RX queues of both ends of the N6 veth pair (`ip link add … numtxqueues n numrxqueues n`); must be a positive integer. With `n ≥ 2` `setup.sh` must build root `mq` with an `fq` child on every TX queue, and `setup.sh-mq-repair` runs. The checks read the queue count from `/sys/class/net/vt-n6/queues/tx-*` |
+| `VT_N6_TXQ_MAX` | `VT_N6_TXQ` | `netns-topo.sh` → VM | Queues **allocated** to both ends of the N6 veth (`numtxqueues`/`numrxqueues`); must be ≥ `VT_N6_TXQ`. When larger, `netns-topo.sh up` reduces the active queues to `VT_N6_TXQ` with `ethtool -L … rx n tx n` on both ends (exit 1 if that fails). With `VT_N6_TXQ < 4 ≤ VT_N6_TXQ_MAX` the `setup.sh-txq-grow` step runs, e.g. `VT_N6_TXQ=2 VT_N6_TXQ_MAX=8` |
 
 ## 7. Emulated topology (`netns-topo.sh`)
 
@@ -136,6 +139,7 @@ Read by the scripts shown; "→ VM" means `l2-vbox.sh` forwards it to `run-tests
 ```
 
 - UEs have `/32` addresses and a default route on their veth; the core routes each `/32` to its UE link and has `default via 10.99.0.1`.
+- `VT_N6_TXQ=n` gives `vt-n6` and `vt-n6c` `n` TX and `n` RX queues each (native XDP on veth needs at least as many RX queues as the peer has TX queues); `up` exits 1 if `vt-n6` does not end up with `n` TX queues. veth is a no-queue device, so its root qdisc is `noqueue` — not `mq` — before `setup.sh` and again after `detach.sh`, whatever the queue count.
 - `up` deletes any previous topology first, then pings `10.99.0.1` from both UEs and exits 1 if either fails.
 - The `d4-fwd-overload-then-tcp` step adds a temporary netns `vt-src` (`10.98.0.2/24`, veth `vt-s0`/`vt-s1`, root side `10.98.0.1`) to send forwarded downlink traffic, and restores `net.ipv4.ip_forward` afterwards.
 
@@ -143,7 +147,7 @@ Run by hand (as root, from the repository root): `sudo ./testbed/netns-topo.sh u
 
 ## 8. What `run-tests.sh` does
 
-Runs as root from the repository root (it `cd`s there itself). Each step writes one line to `summary.txt` and its output to `<step>.log`, except `iperf-verdict` / `counter-verdict` (output in `verdict.txt` / `verdict_counters.txt`) and SKIP lines (no log). In order:
+Runs as root from the repository root (it `cd`s there itself). "Expected attach state" below means: XDP only in the requested slot (`xdpgeneric`, or `xdpdrv` with `VT_XDP_MODE=native`) running the pinned policer; root `fq` when `vt-n6` has one TX queue, otherwise root `mq` with an `fq` child on every TX queue; `clsact`; exactly one egress filter, `pref 1 handle 0x1 direct-action`, running the pinned pacer. Each step writes one line to `summary.txt` and its output to `<step>.log`, except `iperf-verdict` / `counter-verdict` (output in `verdict.txt` / `verdict_counters.txt`) and SKIP lines (no log). In order:
 
 | Step | Checks |
 |---|---|
@@ -153,12 +157,18 @@ Runs as root from the repository root (it `cd`s there itself). Each step writes 
 | `map-sizes-d25` | three `lru_hash` maps with `max_entries 16384`, `ue_policy_map` `hash` 1024; records `nproc` and the `memlock` total |
 | `topology` | `netns-topo.sh up` |
 | `setup.sh-no-bpftool` | with every `bpftool` hidden, `setup.sh vt-n6` exits 2 and changes nothing |
-| `setup.sh`, `setup.sh-no-bpftool-attached`, `setup.sh-rerun`, `attached-after-rerun` | fq kernels only: attach, refusal without bpftool on an attached NIC, re-run keeps exactly one XDP program and one egress filter with the pinned ids. Without fq: `SKIP setup.sh` and `attach-manual` (clsact + `xdpgeneric` + egress filter by hand) |
+| `setup.sh`, `setup.sh-no-bpftool-attached`, `setup.sh-rerun`, `attached-after-rerun` | fq kernels only: attach, refusal without bpftool on an attached NIC, re-run keeps the expected attach state (below). Without fq: `SKIP setup.sh`, `attach-manual` (clsact + XDP in the `VT_XDP_MODE` slot + egress filter by hand) and `attach-manual-xdp-slot` (only that slot, pinned policer id) |
+| `setup.sh-rerun-no-gap` | fq only: `tc monitor` and `ip monitor link` run while `setup.sh` is re-run on the attached NIC. FAIL on any `deleted` qdisc/filter event for `vt-n6`, any link event for `vt-n6` without an XDP program, or different qdisc handles / XDP and filter prog ids afterwards. Most useful with `VT_N6_TXQ ≥ 2` (mq + n fq children) |
+| `setup.sh-mq-repair` | fq and `VT_N6_TXQ ≥ 2` only (SKIP otherwise): a plain root `fq` (as an older `setup.sh` left it), then one `mq` child replaced by `pfifo`; each time `setup.sh` must end in the expected state. Then a root `handle 1:` qdisc that is not `mq` (`prio`, else `htb`, else `fq_codel`, whichever the kernel has; someone else's qdisc on the handle `setup.sh` uses for its `mq`): `setup.sh` must exit 3 and change nothing; after deleting it `setup.sh` attaches again |
 | `set-A`, `set-B` | `10.45.1.23` rx 10 / tx 20, `10.45.1.24` rx 3 / tx 5 |
+| `setup.sh-partial-exit5` | fq only: after `detach.sh`, `setup.sh` runs (as root, with the `VT_XDP_MODE` flag) with a `tc` wrapper first on `PATH` that fails `tc filter replace`: it must exit 5 and print `… may be partially attached …`; `detach.sh` then cleans up and a normal `setup.sh` reaches the expected attach state |
+| `setup.sh-txq-grow` | fq and `VT_N6_TXQ < 4 ≤ VT_N6_TXQ_MAX` only (SKIP otherwise), right after `xdp-mode-switch`: `detach.sh`, `ethtool -L vt-n6 tx 2`, `setup.sh`, then `ethtool -L vt-n6 tx 4` **without** re-running `setup.sh`: the expected attach state must hold for all 4 active queues (`setup.sh` puts `fq` on every allocated queue, not only the active ones), and UE-A's `iperf3 -R -P 8` (own server on port 5205) must carry traffic (≥ 2 Mbps) and must not exceed its 20 Mbps tx cap by more than 10% (`counter_verdict.py` on `spec_txq_grow.csv`; under cap is not judged here). A re-run of `setup.sh` then still passes, and the original queue count is restored |
+| `xdp-mode-switch` | fq only: `setup.sh vt-n6 --xdp-mode <other>` then `--xdp-mode <VT_XDP_MODE>` (generic → native → generic by default). After each: only the requested slot holds the pinned policer, TC side as expected, UE-A pings are counted in `rx_pkts`. Then `setup.sh --xdp-mode <mode> vt-n6` (flag before the interface) and `--xdp-mode bogus` (exit 1, nothing changed) |
 | (iperf3) | Four concurrent sessions from the UE namespaces to `10.99.0.1` ports 5201–5204 (README §8); without fq only the two uplink sessions (`SKIP dl-pacing`). Counter snapshots `stats_t1.txt`/`stats_t2.txt` at 5 s and `T−1` s |
 | `setup.sh-rerun-under-load` | fq only: `setup.sh` re-run in the middle of the iperf3 run; the verdicts below cover that moment |
 | `iperf-verdict`, `counter-verdict` | `iperf_verdict.py` / `counter_verdict.py` on `spec.csv` (±10%) |
 | `d16-tx-segments` | fq only: UE-A `tx_bytes / tx_packets ≤ 1514` (TX counts wire segments) |
+| `dl-multiflow-ue-cap` | fq only: UE-A and UE-B each run `iperf3 -R -P 4` (4 downlink flows) at the same time; `counter_verdict.py` on `spec_multiflow.csv` must find each UE's `tx_bytes` rate within ±10% of its tx cap (20 / 5 Mbps), i.e. the cap holds for the sum of the flows, also when they are spread over several `fq` instances. The log lists the bytes each `fq` sent; with `VT_N6_TXQ ≥ 2` and fewer than two queues used it prints a `WARN` (flow hashing put everything on one queue; not a FAIL) |
 | `killswitch` | `tx-mbps 0` for UE-B: ping fails, `tx_drops` rises, UE-A unaffected; on fq kernels also survives a `setup.sh` re-run |
 | `reset` | UE-B disappears from `list` |
 | `d7-reset-clears`, `d26-same-set-keeps-state`, `d26-changed-set-clears` | `reset` removes `rx_state_map`/`tx_tstamp_map` entries; same-value `set` prints `(unchanged; rx/tx state kept)` and keeps them byte-for-byte; a changed rx or tx clears them |
@@ -167,7 +177,7 @@ Runs as root from the repository root (it `cd`s there itself). Each step writes 
 | `setup.sh-nonroot` | fq only: re-run, `detach.sh`, fresh `setup.sh` as `VT_NONROOT_USER` |
 | `unload-refused-while-attached` | `unload` exits non-zero, prints `detach.sh vt-n6`, pins and hooks unchanged |
 | `detach-rc` | `detach.sh` as `nobody` exits 4 without changing anything; on a missing interface exits 1 |
-| `detach` | `detach.sh vt-n6` leaves no XDP program and no bpf egress filter |
+| `detach` | `detach.sh vt-n6` leaves no XDP program and no bpf egress filter; on fq kernels also no `fq`/`mq` qdisc (veth's own default is `noqueue`) |
 | `setup.sh-ingress-refused` | fq only: with an `ingress` qdisc present, `setup.sh` exits 3 and changes nothing |
 | `unload` | `unload` succeeds and leaves no Vantage pins in `/sys/fs/bpf` |
 | `upgrade-from-hash-pins`, `upgrade-from-lru1024-pins` | load + attach an older build (state maps `HASH`/1024, or `LRU_HASH`/1024), then the new `load` must exit 1 with `max_entries 1024 -> 16384` and the procedure, leave everything unchanged, and the documented `detach → unload → load → setup → set` must work |
@@ -183,7 +193,7 @@ L1: `_workspace/l1-<ts>/`; L2: `_workspace/l2-<release>-<ts>/` (`_workspace*` is
 | `summary.txt` | One line per step: `[PASS]`, `[FAIL] <step> see <step>.log` (`see verdict.txt` / `see verdict_counters.txt` for the two verdict steps), or `[SKIP] <step> <reason>` (no log). **Read this first.** The script's exit code is 1 if any line is `FAIL` |
 | `<step>.log` | stdout+stderr of that step; for a FAIL the last lines say which expectation was not met |
 | `commit.txt` | Tested tree as `git describe --always --dirty` of the host checkout: the short HEAD hash, with `-dirty` appended when **tracked** files had uncommitted changes (the run then tested HEAD plus those changes; untracked new files are not reflected). L2 also `release=<release> vm=<name>`. Results recorded before this change hold only the HEAD hash even if the tree was dirty |
-| `env.txt` | Kernel (`uname -r`), `no-git` (L1/L2 copy the tree without `.git`; use `commit.txt`. A direct `run-tests.sh` run in a checkout writes `git describe --always --dirty` here), `os=…`, `iproute2=…`, `bpftool=<path used by the test>`, `setup_as=… no_bpftool=…`, `has_fq=0/1`, `root_pins_before=` (pins left in the bpffs root by older builds) |
+| `env.txt` | Kernel (`uname -r`), `no-git` (L1/L2 copy the tree without `.git`; use `commit.txt`. A direct `run-tests.sh` run in a checkout writes `git describe --always --dirty` here), `os=…`, `iproute2=…`, `bpftool=<path used by the test>`, `setup_as=… no_bpftool=…`, `xdp_mode=… (setup.sh args: …) n6_txq=…`, `has_fq=0/1`, `root_pins_before=` (pins left in the bpffs root by older builds) |
 | `spec.csv` | The sessions that were run (`label,ue_ip,direction,cap_mbps,json_path`) |
 | `a_ul.json`, `b_ul.json`, `a_dl.json`, `b_dl.json` | `iperf3 -J` output of the concurrent sessions (`*_dl.json` only with fq) |
 | `verdict.txt` | `iperf_verdict.py` table: steady-state goodput vs cap |
@@ -192,6 +202,9 @@ L1: `_workspace/l1-<ts>/`; L2: `_workspace/l2-<release>-<ts>/` (`_workspace*` is
 | `stats_after_iperf.txt`, `list.txt` | `stats` after the run, `list` after the two `set`s |
 | `attach-before-rerun.txt`, `attach-after-rerun.txt` | `ip -d link`, `tc qdisc`, `tc filter … egress` around the `setup.sh` re-run (fq only) |
 | `d4_udp.json`, `d4_tcp.json`, `d6_udp.json` | iperf3 output of the regression steps |
+| `spec_txq_grow.csv`, `a_dl_p8.json`, `stats_grow_t1.txt`, `stats_grow_t2.txt`, `verdict_txq_grow.txt` | `setup.sh-txq-grow` inputs and counter verdict |
+| `rerun-no-gap.tc`, `rerun-no-gap.link` | `tc monitor` / `ip monitor link` output captured during `setup.sh-rerun-no-gap` |
+| `spec_multiflow.csv`, `a_dl_p4.json`, `b_dl_p4.json`, `stats_mf_t1.txt`, `stats_mf_t2.txt` | `dl-multiflow-ue-cap`: spec, iperf3 output and counter snapshots (judged by `counter_verdict.py`; result in `dl-multiflow-ue-cap.log`) |
 
 Interpreting the verdicts (same scripts and format as the top-level README §8.5):
 
@@ -213,9 +226,9 @@ python3 .claude/skills/vantage-testbed/scripts/counter_verdict.py $d/spec.csv $d
 
 - **No `sch_fq` in Docker Desktop's kernel (L1).** EDT pacing needs a root `fq` qdisc, so `setup.sh` cannot run and downlink pacing is untestable; `run-tests.sh` detects this (`has_fq=0` in `env.txt`) and attaches without fq. Use L2.
 - **Throughput depends on the host.** Both levels run iperf3 on the same machine as the datapath. A busy host (other VMs, builds) makes sessions fall **under** their caps; counter and iperf verdicts then fail although the datapath is fine. Check host load before trusting an under-cap result (`uptime`; on macOS also the VM's `VBoxHeadless` CPU in Activity Monitor). Over-cap results are not caused by load.
-- **Emulated N6 only.** veth pairs, `xdpgeneric`, a single queue, no GTP and no real UPF: native XDP, multi-queue NICs (`mq` root qdisc), BIG TCP / GRO sizes and the core's NAT behaviour are only checked on the physical server (runbook §6).
+- **Emulated N6 only.** veth pairs, no GTP and no real UPF. `VT_XDP_MODE=native` exercises the veth driver's native XDP and `VT_N6_TXQ` gives veth software TX queues (so the `mq` + per-queue `fq` layout and cross-queue pacing are tested), but a physical NIC driver's native XDP support, its hardware queues and IRQ/XPS mapping, BIG TCP / GRO sizes and the core's NAT behaviour are only checked on the physical server (runbook §6).
 - **`unload` guard is per network namespace.** Attachments inside the UE/core namespaces would not be seen; the tests attach only in the service-node namespace.
-- **`l1-docker.sh` forwards only `T`.** `VT_NAT`, `VT_NETEM`, `VT_SETUP_AS` take effect on L2 only.
+- **`VT_*` on L1.** `l1-docker.sh` forwards them, but without `sch_fq` and without an `ubuntu` user the `setup.sh`-related ones (`VT_SETUP_AS`, `VT_NONROOT_USER`, the `--xdp-mode` steps) only take effect on L2.
 
 ## 11. Troubleshooting
 
