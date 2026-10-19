@@ -26,7 +26,7 @@ $(VMLINUX_H):
 check:
 	@command -v cargo   >/dev/null || (echo "cargo not found"; exit 1)
 	@command -v clang   >/dev/null || (echo "clang not found"; exit 1)
-	@command -v bpftool >/dev/null || (echo "bpftool not found"; exit 1)
+	@bpftool version >/dev/null 2>&1 || (echo "bpftool not usable (Ubuntu: apt install linux-tools-common linux-tools-$$(uname -r))"; exit 1)
 	@command -v tc      >/dev/null || (echo "tc not found"; exit 1)
 	@command -v ip      >/dev/null || (echo "ip not found"; exit 1)
 	@test -f $(VMLINUX_BTF) || (echo "$(VMLINUX_BTF) not found"; exit 1)

@@ -8,6 +8,10 @@
 #   1. `make build`                         # produces the .o objects
 #   2. `sudo ./target/release/vantage-5G load`  # loads & pins the programs
 #   3. `sudo ./setup.sh <iface>`            # this script
+# Requires a working bpftool (also needed by `make build`). Ubuntu 22.04/24.04:
+# install linux-tools-common linux-tools-$(uname -r); the /usr/sbin/bpftool
+# wrapper only works with the latter, and neither release ships an installable
+# 'bpftool' package.
 #
 # Idempotent: safe to re-run on an interface that is already attached (e.g.
 # after `detach.sh` -> `unload` -> `load` to pick up a new .o). No step removes
@@ -21,27 +25,17 @@
 # The script ends by checking the resulting attach state and exits non-zero if
 # it is not what is expected.
 #
-# Exit codes: 1 usage, 2 programs not loaded, 3 conflicting hook found
-# (nothing was changed), 4 post-attach check failed, other = command failure.
+# Exit codes: 1 usage / no such iface, 2 programs not loaded or bpftool not
+# usable, 3 conflicting hook found (nothing was changed), 4 post-attach check
+# failed, other = command failure.
 #
-# How "is this attached program Vantage's?" is decided (iproute2 5.15 /
-# Ubuntu 22.04 prints only `id N tag ...`, no prog name; and without
-# CAP_SYS_ADMIN no iproute2 prints the name), by attached prog id:
-#   1. id == id of the pinned program  (pinned ids from `bpftool prog show
-#      pinned`, or -- if bpftool is not usable -- from a short-lived dummy
-#      probe interface the pinned programs are attached to and read back)
-#   2. else the kernel prog name of that id starts with vantage_rx_poli /
-#      vantage_tx_pace (from `bpftool prog show id N`, or from iproute2 output
-#      when it prints names). This catches a program left attached from an
-#      earlier `load` (same name, different id).
-#   3. the attached program's tag (hash of its instructions, printed by
-#      iproute2 5.15 and 6.x) equals the pinned program's tag: same .o loaded
-#      again, e.g. `unload`/`load` while attached, without bpftool on 22.04.
-#   4. tc only: the cls_bpf label tc stored at attach time
-#      (`vantage_tx_pacer:[*fsobj]`, printed by 5.15 and 6.x).
-# If none of these can be evaluated, an occupied slot counts as "not ours"
-# (exit 3, nothing changed).
-# All reads go through ${SUDO}: iproute2 needs CAP_SYS_ADMIN to resolve names.
+# "Is this attached program Vantage's?" is decided by the attached prog id
+# (iproute2 prints `id N` on 5.15 and 6.x; names only on 6.x and only with
+# CAP_SYS_ADMIN, so names from iproute2 are not used):
+#   1. id == id of the pinned program (bpftool prog show pinned), or
+#   2. bpftool's kernel name for that id starts with vantage_rx_poli /
+#      vantage_tx_pace: a program left attached from an earlier `load`.
+# All reads go through ${SUDO}.
 
 set -eu
 
@@ -62,11 +56,9 @@ PROG_TC="${PIN_DIR}/vantage_tx_pacer"
 # Our egress filter slot. Fixed so a re-run replaces instead of stacking.
 TC_PREF=1
 TC_HANDLE=1
-# Kernel prog names are truncated to 15 chars (BPF_OBJ_NAME_LEN - 1);
-# that is what iproute2 6.x prints. bpftool prints the full BTF name.
+# Kernel prog names are truncated to 15 chars (BPF_OBJ_NAME_LEN - 1).
 XDP_KNAME="vantage_rx_poli"
 TC_KNAME="vantage_tx_pace"
-TC_LABEL="vantage_tx_pacer:["
 
 if ! ${SUDO} test -e "${PROG_XDP}" || ! ${SUDO} test -e "${PROG_TC}"; then
     echo "[-] pinned programs not found under ${PIN_DIR}"
@@ -79,6 +71,19 @@ if ! ${SUDO} ip link show dev "${IFACE}" >/dev/null 2>&1; then
     exit 1
 fi
 
+# Id of pinned prog $1, or "" (bpftool's first line is "<id>: <type> name ...").
+pinned_id() { ${SUDO} bpftool prog show pinned "$1" 2>/dev/null | sed -n '1s/^\([0-9]*\):.*/\1/p'; }
+
+PIN_XDP_ID="$(pinned_id "${PROG_XDP}")"
+PIN_TC_ID="$(pinned_id "${PROG_TC}")"
+if [[ -z "${PIN_XDP_ID}" || -z "${PIN_TC_ID}" ]]; then
+    echo "[-] bpftool is not usable: 'bpftool prog show pinned ${PROG_XDP}' failed."
+    echo "    setup.sh needs it to identify attached programs (make build needs it too)."
+    echo "    Ubuntu 22.04/24.04: sudo apt install linux-tools-common linux-tools-$(uname -r)"
+    echo "    (/usr/sbin/bpftool is only a wrapper; there is no installable 'bpftool' package)"
+    exit 2
+fi
+
 # ---------------------------------------------------------------- helpers ---
 
 # XDP attach-mode keyword of IFACE (xdp|xdpgeneric|xdpoffload|xdpmulti) or "".
@@ -87,100 +92,37 @@ xdp_mode() {
         | grep -oE ' xdp(generic|offload|multi)?( |/)' | tr -d ' /' || true
 }
 
-# Tag of the (first) XDP program attached to IFACE, or "".
-xdp_attached_tag() {
-    ${SUDO} ip -d link show dev "${IFACE}" \
-        | sed -n 's/.*prog\/xdp[a-z]* id [0-9]* .*tag \([0-9a-f]*\).*/\1/p' | head -1
-}
-
 # Id of the (first) XDP program attached to IFACE, or "".
 xdp_attached_id() {
     ${SUDO} ip -d link show dev "${IFACE}" \
         | sed -n 's/.*prog\/xdp[a-z]* id \([0-9]*\).*/\1/p' | head -1
 }
 
-# Name iproute2 printed for the attached XDP program ("" on 5.15 / no caps).
-xdp_attached_name() {
-    ${SUDO} ip -d link show dev "${IFACE}" \
-        | sed -n 's/.*prog\/xdp[a-z]* id [0-9]* name \([^ ]*\).*/\1/p' | head -1
-}
-
-HAVE_BPFTOOL=0
-if command -v bpftool >/dev/null 2>&1 \
-        && ${SUDO} bpftool prog show pinned "${PROG_XDP}" >/dev/null 2>&1; then
-    HAVE_BPFTOOL=1   # (Ubuntu's /usr/sbin/bpftool wrapper fails without linux-tools-$(uname -r))
-fi
-
-# Kernel name of prog id $1 via bpftool, or "".
-prog_name_by_id() {
-    [[ "${HAVE_BPFTOOL}" -eq 1 && -n "$1" ]] || return 0
-    ${SUDO} bpftool prog show id "$1" 2>/dev/null | head -1 \
-        | sed -n 's/.* name \([^ ]*\) .*/\1/p'
-}
-
-# Pinned program ids. bpftool first; otherwise attach the pins to a temporary
-# dummy interface and read the ids back with iproute2 (works on 5.15).
-PIN_XDP_ID=""; PIN_TC_ID=""; PIN_XDP_TAG=""; PIN_TC_TAG=""; ID_SRC="none"
-PROBE="vtprobe$$"
-cleanup_probe() { ${SUDO} ip link del "${PROBE}" >/dev/null 2>&1 || true; }
-if [[ "${HAVE_BPFTOOL}" -eq 1 ]]; then
-    PIN_XDP_ID="$(${SUDO} bpftool prog show pinned "${PROG_XDP}" | head -1 | sed -n 's/^\([0-9]*\):.*/\1/p')"
-    PIN_TC_ID="$(${SUDO} bpftool prog show pinned "${PROG_TC}" | head -1 | sed -n 's/^\([0-9]*\):.*/\1/p')"
-    PIN_XDP_TAG="$(${SUDO} bpftool prog show pinned "${PROG_XDP}" | head -1 | sed -n 's/.* tag \([0-9a-f]*\).*/\1/p')"
-    PIN_TC_TAG="$(${SUDO} bpftool prog show pinned "${PROG_TC}" | head -1 | sed -n 's/.* tag \([0-9a-f]*\).*/\1/p')"
-    ID_SRC="bpftool"
-else
-    trap cleanup_probe EXIT
-    if ${SUDO} ip link add "${PROBE}" type dummy >/dev/null 2>&1 \
-            && ${SUDO} ip link set dev "${PROBE}" xdpgeneric pinned "${PROG_XDP}" >/dev/null 2>&1 \
-            && ${SUDO} tc qdisc add dev "${PROBE}" clsact >/dev/null 2>&1 \
-            && ${SUDO} tc filter add dev "${PROBE}" egress pref 1 handle 1 bpf da pinned "${PROG_TC}" >/dev/null 2>&1; then
-        PIN_XDP_ID="$(${SUDO} ip -d link show dev "${PROBE}" | sed -n 's/.*prog\/xdp[a-z]* id \([0-9]*\).*/\1/p' | head -1)"
-        PIN_TC_ID="$(${SUDO} tc filter show dev "${PROBE}" egress | sed -n 's/.* id \([0-9]*\) .*/\1/p' | head -1)"
-        PIN_XDP_TAG="$(${SUDO} ip -d link show dev "${PROBE}" | sed -n 's/.*prog\/xdp[a-z]* id [0-9]* .*tag \([0-9a-f]*\).*/\1/p' | head -1)"
-        PIN_TC_TAG="$(${SUDO} tc filter show dev "${PROBE}" egress | sed -n 's/.* tag \([0-9a-f]*\).*/\1/p' | head -1)"
-        ID_SRC="probe"
-    fi
-    cleanup_probe
-    trap - EXIT
-    if [[ -z "${PIN_XDP_ID}" || -z "${PIN_TC_ID}" ]]; then
-        PIN_XDP_ID=""; PIN_TC_ID=""; PIN_XDP_TAG=""; PIN_TC_TAG=""; ID_SRC="none"
-    fi
-fi
-
-# Is attached XDP prog id $1 (iproute2 name $2, tag $3; may be "") Vantage's?
-is_vantage_xdp() {
-    local id="$1" name="$2" tag="${3:-}"
+# Is prog id $1 Vantage's? $2 = pinned id, $3 = kernel name prefix.
+is_vantage_id() {
+    local id="$1" pin="$2" kname="$3" name
     [[ -n "${id}" ]] || return 1
-    [[ -n "${PIN_XDP_ID}" && "${id}" == "${PIN_XDP_ID}" ]] && return 0
-    [[ -n "${PIN_XDP_TAG}" && "${tag}" == "${PIN_XDP_TAG}" ]] && return 0
-    [[ -z "${name}" ]] && name="$(prog_name_by_id "${id}")"
-    [[ "${name}" == "${XDP_KNAME}"* ]]
-}
-
-# Is this `tc filter show` detail line a Vantage pacer?
-is_vantage_tc_line() {
-    local line="$1" id name
-    id="$(sed -n 's/.* id \([0-9]*\) .*/\1/p' <<<"${line}")"
-    [[ -n "${id}" && -n "${PIN_TC_ID}" && "${id}" == "${PIN_TC_ID}" ]] && return 0
-    [[ -n "${PIN_TC_TAG}" && "${line}" == *" tag ${PIN_TC_TAG}"* ]] && return 0
-    [[ "${line}" == *"${TC_LABEL}"* ]] && return 0
-    name="$(sed -n 's/.* name \([^ ]*\) .*/\1/p' <<<"${line}")"
-    [[ -z "${name}" ]] && name="$(prog_name_by_id "${id}")"
-    [[ -n "${name}" && "${name}" == "${TC_KNAME}"* ]]
+    [[ "${id}" == "${pin}" ]] && return 0
+    name="$(${SUDO} bpftool prog show id "${id}" 2>/dev/null | sed -n '1s/.* name \([^ ]*\) .*/\1/p')"
+    [[ -n "${name}" && "${name}" == "${kname}"* ]]
 }
 
 # Filter detail lines (the ones carrying "handle") on IFACE egress.
 tc_egress_lines() { ${SUDO} tc filter show dev "${IFACE}" egress "$@" | grep 'handle' || true; }
 
+# Is this `tc filter show` detail line a Vantage pacer?
+is_vantage_tc_line() {
+    is_vantage_id "$(sed -n 's/.* id \([0-9]*\) .*/\1/p' <<<"$1")" "${PIN_TC_ID}" "${TC_KNAME}"
+}
+
 # -------------------------------------------------------------- pre-flight ---
 
 echo "=== 0. pre-flight: look for conflicting hooks (nothing changed yet) ==="
-echo "    pinned prog ids: xdp=${PIN_XDP_ID:-?} tc=${PIN_TC_ID:-?} (source: ${ID_SRC})"
+echo "    pinned prog ids: xdp=${PIN_XDP_ID} tc=${PIN_TC_ID}"
 # XDP mode policy:
 #   - nothing attached                 -> attach in generic mode
 #   - generic, Vantage program (re-run / reload) -> atomic replace with -force
-#   - generic, someone else's program, or ownership undeterminable -> exit 3
+#   - generic, someone else's program  -> exit 3
 #   - native / offload / multi (any program, including ours attached by hand
 #     with xdpdrv)                      -> refuse (exit 3). The kernel forbids
 #     generic and native on the same device at the same time, and silently
@@ -192,13 +134,9 @@ case "${MODE}" in
     "")  ;;
     xdpgeneric)
         AID="$(xdp_attached_id)"
-        if ! is_vantage_xdp "${AID}" "$(xdp_attached_name)" "$(xdp_attached_tag)"; then
-            echo "[-] ${IFACE} already has a generic-mode XDP program (id ${AID:-?}, tag $(xdp_attached_tag))"
-            echo "    that is not the pinned Vantage program (id ${PIN_XDP_ID:-?}, tag ${PIN_XDP_TAG:-?})"
-            echo "    and could not be identified as an older Vantage load (name not available:"
-            echo "    iproute2 < 6 prints no names; install bpftool to resolve names by id)."
-            echo "    Refusing to replace it. If it is Vantage (e.g. after loading a new .o),"
-            echo "    run 'sudo ./detach.sh ${IFACE}' and re-run; otherwise detach the other tool's program."
+        if ! is_vantage_id "${AID}" "${PIN_XDP_ID}" "${XDP_KNAME}"; then
+            echo "[-] ${IFACE} already has a generic-mode XDP program (id ${AID:-?}) that is not Vantage's."
+            echo "    Refusing to replace it; detach the other tool's program first."
             exit 3
         fi
         ;;
@@ -222,7 +160,7 @@ fi
 while IFS= read -r line; do
     [[ -n "${line}" ]] || continue
     if ! is_vantage_tc_line "${line}"; then
-        echo "[-] ${IFACE} egress pref ${TC_PREF} holds a non-Vantage (or unidentifiable) filter:"
+        echo "[-] ${IFACE} egress pref ${TC_PREF} holds a non-Vantage filter:"
         echo "      ${line}"
         echo "    Refusing to replace it."
         exit 3
@@ -274,13 +212,7 @@ fail() { echo "[-] verify: $*"; ERR=1; }
 MODE="$(xdp_mode)"
 AID="$(xdp_attached_id)"
 [[ "${MODE}" == "xdpgeneric" ]] || fail "XDP mode is '${MODE:-none}', expected xdpgeneric"
-if [[ -n "${PIN_XDP_ID}" ]]; then
-    [[ "${AID}" == "${PIN_XDP_ID}" ]] || fail "XDP prog id ${AID:-none} != pinned ${PROG_XDP} id ${PIN_XDP_ID}"
-else
-    is_vantage_xdp "${AID}" "$(xdp_attached_name)" "$(xdp_attached_tag)" \
-        || echo "    [!] XDP prog id ${AID:-none}: identity not verifiable (no bpftool, probe failed)"
-    [[ -n "${AID}" ]] || fail "no XDP program attached"
-fi
+[[ "${AID}" == "${PIN_XDP_ID}" ]] || fail "XDP prog id ${AID:-none} != pinned ${PROG_XDP} id ${PIN_XDP_ID}"
 
 QDISCS="$(${SUDO} tc qdisc show dev "${IFACE}")"
 grep -q '^qdisc fq [0-9a-f]*: root' <<<"${QDISCS}" \
@@ -300,9 +232,7 @@ else
     grep -q "pref ${TC_PREF} .*handle 0x${TC_HANDLE} " <<<"${OURS}" \
         || fail "Vantage egress filter not at pref ${TC_PREF} handle ${TC_HANDLE}: ${OURS}"
     grep -q 'direct-action' <<<"${OURS}" || fail "Vantage egress filter is not direct-action"
-    if [[ -n "${PIN_TC_ID}" ]]; then
-        grep -q " id ${PIN_TC_ID} " <<<"${OURS}" || fail "egress filter prog id != pinned ${PROG_TC} id ${PIN_TC_ID}"
-    fi
+    grep -q " id ${PIN_TC_ID} " <<<"${OURS}" || fail "egress filter prog id != pinned ${PROG_TC} id ${PIN_TC_ID}"
 fi
 # Other egress filters are not ours to touch, but a direct-action filter at a
 # lower pref can return before the pacer runs. Warn.
