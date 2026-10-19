@@ -2,6 +2,7 @@
 
 - 대상 커밋: `main`의 `d80ee7b` 이후. 아래 `<COMMIT>`을 실제로 받은 해시로 바꾼다. `d80ee7b`에는 4.2의 판정 스크립트 `counter_verdict.py`가 들어 있다(`311ee1c`에는 없음).
 - 로컬 근거: 로컬 L1/L2 실행은 `ddc00c8` + 미커밋 변경 상태의 작업 트리에서 했다(당시 결과의 `commit.txt`는 HEAD만 기록해 `ddc00c8`로 남아 있다). 그 미커밋 변경이 이후 `311ee1c`로 커밋되었고, `311ee1c`와 `d80ee7b`의 제품 코드(`*.c`, `src/`, `setup.sh`, `detach.sh`, `Makefile`)는 같다(`git diff --stat 311ee1c d80ee7b`). 결과: L1 Docker와 L2 VirtualBox(Ubuntu 22.04)에서 전 단계 PASS. L2 24.04는 기능 단계 전부 PASS, 처리량은 호스트 부하로 판정 보류. 상세 보고서는 개발자 로컬 기록이며 저장소에는 없다.
+- `setup.sh --xdp-mode`와 멀티큐(root `mq` + 큐별 `fq`) 처리(3.3, 3.3a, 4.4a, 5.2)는 브랜치 `feat/setup-mq-xdpmode`의 변경이다. 이 기능이 들어간 커밋을 `<COMMIT>`으로 쓴다. 로컬 근거: L2 VirtualBox(Ubuntu 22.04·24.04)의 veth N6에서 TX 큐 1·2·4개, generic·native 조합으로 확인했다.
 - 형식: 각 단계는 **명령 / 기대 결과 / 실패 시** 순서다.
 - 기호(예시 값은 README §3.2와 같다. 실제 값으로 바꾼다):
 
@@ -136,7 +137,7 @@ DL 응답이 Vantage가 붙은 `<IF>`로 나가야 TX 페이서와 killswitch가
 
 ### 1.8 NIC 정보 기록 (X2/X7/X8)
 - 명령: `ethtool -i <IF>; ethtool -l <IF>; tc qdisc show dev <IF>; ip -d link show dev <IF>; ethtool -k <IF> | grep -E 'generic-receive|large-receive'; ip -d link show dev <IF> | grep -oE 'gro_max_size [0-9]+|gro_ipv4_max_size [0-9]+'`
-- 기대: 드라이버명, 큐 수, root qdisc(`mq`일 수 있음)를 기록한다. 이미 붙은 `prog/xdp`나 egress 필터가 없어야 한다. `gro_max_size`/`gro_ipv4_max_size`는 65536 이하여야 한다(X15, BIG TCP 비활성).
+- 기대: 드라이버명, 큐 수, root qdisc(`mq`일 수 있음)를 기록한다. TX 큐 수는 `ls -d /sys/class/net/<IF>/queues/tx-* | wc -l`(사용 중 N)와 `ip -d link show dev <IF> | grep -o 'numtxqueues [0-9]*'`(할당 M)로도 기록한다(`setup.sh`가 쓰는 값, 3.3). `sysctl net.core.default_qdisc`도 기록한다(5.2에서 detach 후 복원될 자식 qdisc 종류). 드라이버명은 3.3a(native XDP 시도) 판단에 쓴다. 이미 붙은 `prog/xdp`나 egress 필터가 없어야 한다. `gro_max_size`/`gro_ipv4_max_size`는 65536 이하여야 한다(X15, BIG TCP 비활성).
 - 실패 시: 다른 도구의 XDP/tc가 붙어 있으면 그 소유자와 먼저 조율한다(setup.sh가 exit 3으로 거부함). gro 값이 65536보다 크면 기록하고 계속 진행한다. UL에서 큰 프레임 영구 드롭이 의심되면 보고한다.
 
 ## 2. 업그레이드인 경우 (이전 버전이 이 서버에서 돌고 있었다면)
@@ -174,11 +175,33 @@ DL 응답이 Vantage가 붙은 `<IF>`로 나가야 TX 페이서와 killswitch가
 - 기대: 두 번 모두 rc=0, 첫 줄은 `[i] BPF objects from <저장소 절대 경로>`(두 번째 실행은 이어서 `already pinned, skipping load`). `/sys/fs/bpf/vantage`에 프로그램 2개와 맵 4개가 있다. 맵 타입은 `lru_hash` 3개(`max_entries 16384`), `ue_policy_map`은 `hash`(`max_entries 1024`)이다. LRU 3개는 load 시 전량 사전 할당되며 `memlock` 합계는 24.04(6.8)에서 약 4.5 MiB(로컬 4,721,856 B), 22.04(5.15)에서는 커널의 계산 방식 차이로 약 1.5 MiB(로컬 1,572,864 B)로 표시된다(로컬 L2 `map-sizes-d25` 단계 기록, README §3.1). 이 값을 기록한다.
 - 실패 시: `pinned maps … do not match the object`이면 2장(업그레이드)으로 간다. `Error: BPF object files not found`이면 위에 나열된 디렉터리별 누락 파일을 보고 3.1(`make build`)을 확인한다(`load`는 `<exe>/../..`(저장소) → exe 디렉터리 → 현재 디렉터리(최후) 순으로 두 .o를 찾고, `--obj-dir <DIR>`이면 그 디렉터리만 본다. README §12.3). 출력 전체를 보고한다.
 
-### 3.3 setup.sh (재실행 포함)
-- 명령: `sudo ./setup.sh <IF>; echo rc=$?; sudo ./setup.sh <IF>; echo rc=$?; ip -d link show dev <IF>; tc qdisc show dev <IF>; tc filter show dev <IF> egress`
-- 기대: 두 번 모두 rc=0. `xdpgeneric` + `prog/xdp id <핀 id>`, root `fq`, `clsact`, egress `pref 1 … handle 0x1 … direct-action … id <핀 id>` 필터 1개.
-- 실패 시: rc=2이면 `bpftool version`을 확인한다(1.2). rc=3이면 출력에 나온 충돌 훅을 확인한다(native XDP는 X8, 남의 필터, `ingress` qdisc). rc=4이면 출력된 현재 상태를 보고한다. root qdisc가 `mq`였던 멀티큐 NIC에서는 `fq`로 바뀌는 것이 정상이다(X7). 재실행 rc와 공백 여부를 기록한다.
+### 3.3 setup.sh (generic, 재실행 포함)
+- 명령:
+  ```bash
+  sysctl net.core.default_qdisc
+  sudo ./setup.sh <IF> 2>&1 | tee ~/vt-l4/3.3-setup1.txt; echo rc=${PIPESTATUS[0]}
+  tc qdisc show dev <IF> | tee ~/vt-l4/3.3-qdisc1.txt
+  sudo ./setup.sh <IF> 2>&1 | tee ~/vt-l4/3.3-setup2.txt; echo rc=${PIPESTATUS[0]}
+  tc qdisc show dev <IF> | tee ~/vt-l4/3.3-qdisc2.txt
+  ip -d link show dev <IF>; tc filter show dev <IF> egress; sysctl net.core.default_qdisc
+  ```
+- 기대: 두 번 모두 rc=0. 플래그 없이 실행하면 generic이다: `xdpgeneric` + `prog/xdp id <핀 id>`, `clsact`, egress `pref 1 … handle 0x1 … direct-action … id <핀 id>` 필터 1개. qdisc는 1.8에서 기록한 TX 큐 수 N에 따라 다르다.
+  - N=1: root `fq`. 출력 끝 `TX qdisc  root fq`.
+  - N≥2: root `mq 1:`이고 **모든 mq 클래스** `parent 1:1` … `parent 1:<M, 16진수>`(M = 1.8의 numtxqueues, 사용하지 않는 큐 포함)가 `fq`. 출력 끝 `TX qdisc  root mq 1: + fq on all M mq classes (N TX queues in use)`. 첫 실행 출력에 `current root: mq 0:; creating root mq 1:`(커널 기본 mq에서 전환)이 나오고, `net.core.default_qdisc`가 fq가 아니었으면 `net.core.default_qdisc <값> -> fq for the mq creation only`와 `… restored to <값>`이 나온다. M > N이면 `setting fq on mq classes: 1:<N+1> …`도 나온다. 두 번째 실행은 `… already in place (kept, no change)`이고 `3.3-qdisc1.txt`와 `3.3-qdisc2.txt`의 handle이 같다(재실행 시 qdisc 무변경). 마지막 `sysctl` 값이 처음 값과 같고 `ls /run/vantage-5g.default_qdisc`가 없다(No such file).
+- 실패 시: rc=2이면 `bpftool version`을 확인한다(1.2). rc=3이면 출력의 `[-]` 줄을 확인한다: 남의 XDP 프로그램, 남의 필터, `ingress` qdisc, `has a qdisc using handle 1:`(멀티큐에서 root `prio 1:`/`htb 1:` 등 — 쓰는 곳이 없으면 `sudo tc qdisc del dev <IF> root` 후 재실행), `kernel module(s) not available`(`sch_fq`/`cls_bpf`/`sch_ingress`, `modinfo <모듈>` 결과를 기록). rc=5이면 `step failed … may be partially attached` 줄을 기록하고 `sudo ./detach.sh <IF>` 후 원인을 고쳐 재실행한다. 시작 시 `[!] /run/vantage-5g.default_qdisc exists` 경고가 나오면 이전 실행이 중단된 것이다 — 출력된 복구 명령(`sysctl -w net.core.default_qdisc=<원래값>`, 파일 삭제)을 실행하고 기록한다. rc=4이면 출력된 현재 상태(`[-] verify: …`)를 보고한다(예: `TX queue classes without fq under root …`). 마지막 `sysctl` 값이 처음과 다르면 보고하고 `sudo sysctl -w net.core.default_qdisc=<처음 값>`으로 되돌린다. 첫 전환(커널 기본 `mq` → `mq 1:`) 순간에 큐에 있던 패킷은 버려진다. 트래픽이 흐르는 중이었다면 링크 리셋 여부(`dmesg | tail`)와 함께 기록한다(X7).
 - 비root 운영자: `./setup.sh <IF>`(sudo 권한 사용자)로 한 번 더 실행해 rc=0인지 확인한다.
+
+### 3.3a native XDP 시도 (선택, 1.8의 드라이버가 XDP를 지원할 때 — X8)
+1.8의 `ethtool -i <IF>` 드라이버가 native XDP를 지원하는 종류(예: ixgbe, i40e, ice, mlx5, virtio_net)이면 시도한다. 일부 드라이버는 native attach/detach 때 링을 재구성해 **링크가 잠깐 끊긴다** — 원격 SSH가 이 NIC를 거치지 않는지, 트래픽이 없는 시간인지 먼저 확인한다.
+- 명령:
+  ```bash
+  sudo ./setup.sh <IF> --xdp-mode native 2>&1 | tee ~/vt-l4/3.3a-native.txt; echo rc=${PIPESTATUS[0]}
+  ip -d link show dev <IF> | head -3; dmesg | tail -20 | tee ~/vt-l4/3.3a-dmesg.txt
+  ```
+- 기대(지원): rc=0, 출력에 `moving the Vantage program (id …) from 'xdpgeneric' to native mode`와 `RX policer (XDP native, id <핀 id>)`. `ip link` 첫 줄에 `xdp`(native 표시, `xdpgeneric` 아님). 이후 단계는 native로 진행해도 된다(4.2 판정 기준 같음).
+- 기대(미지원): rc=3, `[-] XDP attach in native mode failed: …`(커널 메시지, 예: `Underlying driver does not support XDP in native mode`), 드라이버명, `Use '--xdp-mode generic'`. 이어서 `restoring the previous attach (xdpgeneric, …)`. `ip -d link`가 다시 `xdpgeneric` + 같은 핀 id다. 이 결과를 기록하고 generic으로 계속한다.
+- 실패 시: rc=4와 `restore failed: <IF> has NO XDP RX policer now.`이면 즉시 `sudo ./setup.sh <IF>`(generic)를 실행해 rc=0인지 확인하고 보고한다. 링크가 끊긴 시간(`dmesg`의 `Link is Down/Up`)을 기록한다.
+- generic으로 되돌리기(이후 단계를 generic으로 할 때): `sudo ./setup.sh <IF>; echo rc=$?` → rc=0, `xdpgeneric`.
 
 ### 3.4 잔여 루트 핀 정리 (X4/V14 — 이전에 구버전을 돌린 서버)
 - 명령: `sudo ls /sys/fs/bpf`
@@ -257,6 +280,11 @@ DL 응답이 Vantage가 붙은 `<IF>`로 나가야 TX 페이서와 killswitch가
 - 기대: counter 판정 A-UL이 +10% 이하다.
 - 실패 시: 초과 폭과 큐 수(`ethtool -l`)를 기록한다(D5a 잔여 경합, datapath로 이관).
 
+### 4.4a 멀티큐 DL 다중 플로우 (X20, TX 큐 ≥ 2일 때)
+- 명령: [UE 호스트] `iperf3 -c <SVC> -B <UE_A> -p 5203 -t 30 -R -P 4 -J > a_dl_p4.json`, 동시에 4.2처럼 stats 스냅샷을 남긴다. 측정 전후 [서비스 노드] `tc -s qdisc show dev <IF> | tee ~/vt-l4/4.4a-qdisc-before.txt`(끝나면 `…-after.txt`).
+- 기대: counter 판정 A-DL(cap 20)이 ±10%. 큐별 `fq`의 `Sent` 증가분이 2개 이상의 큐에 나뉜다(플로우가 여러 큐로 퍼진 상태에서도 UE 합계가 cap).
+- 실패 시: cap 초과면 즉시 보고한다(큐별 `fq` 여부 — 3.3의 qdisc 출력). 모든 증가가 한 큐에만 있으면 기록만 한다(플로우 해시 결과).
+
 ### 4.5 killswitch, D4 (선택)
 - killswitch: `sudo ./target/release/vantage-5G set --ue-ip <UE_B> --rx-mbps 3 --tx-mbps 0`(출력 끝 `(killswitch: DL blocked)`) 후 [UE 호스트]에서 `ping -I <UE_B의 uesimtunN> -c3 <SVC>`가 실패하고, `ping -I <UE_A의 uesimtunN> -c3 <SVC>`는 정상이어야 한다. `stats`에서 `<UE_B>`의 TX_DROPS가 증가한다. 이어서 `set … --tx-mbps 5`로 복구한다.
 - D4: UE-A를 tx 1 Mbps로 두고 서비스 노드 뒤(포워딩되는 쪽) 호스트에서 UE-A로 UDP 100M을 10 s 보낸다. 직후 TCP DL이 연결되고 1 Mbps 근처가 나와야 한다. tx_drops 증가는 정상이다. 끝나면 정책을 원래대로 돌린다.
@@ -265,12 +293,12 @@ DL 응답이 Vantage가 붙은 `<IF>`로 나가야 TX 페이서와 killswitch가
 
 ### 5.1 unload 가드
 - 명령: `sudo ./target/release/vantage-5G unload; echo rc=$?`
-- 기대: attach 상태이므로 rc=1이고, `<IF>: xdpgeneric prog id … (vantage_rx_poli)`와 `run: sudo ./detach.sh <IF>`가 출력된다. 핀은 그대로다.
+- 기대: attach 상태이므로 rc=1이고, `<IF>: xdpgeneric prog id … (vantage_rx_poli)`(native로 붙였으면 `xdp(native) prog id …`)와 `run: sudo ./detach.sh <IF>`가 출력된다. 핀은 그대로다.
 
 ### 5.2 detach + unload
 - 명령: `sudo ./detach.sh <IF>; echo rc=$?; ip -d link show dev <IF> | grep -c prog/xdp; tc filter show dev <IF> egress; tc qdisc show dev <IF>; sudo ./target/release/vantage-5G unload; echo rc=$?; sudo ls /sys/fs/bpf`
-- 기대: detach rc=0, `prog/xdp` 0줄, egress 필터 없음, clsact 없음, root는 커널 기본 qdisc(멀티큐 NIC이면 `mq` + 자식 기본 qdisc. 이전에 직접 넣은 custom qdisc는 복원되지 않음). unload rc=0, `/sys/fs/bpf`에 `vantage` 없음.
-- 실패 시: detach rc=4이면 남은 목록을 보고한다(native 드라이버에서 xdp 잔존은 X2).
+- 기대: detach rc=0, `prog/xdp` 0줄(generic·native 슬롯 모두), egress 필터 없음, clsact 없음. root는 커널 기본 qdisc다: 1.8의 TX 큐 N≥2이면 **`mq 0:`**(handle 0, setup.sh의 `mq 1:`이 아님)에 자식이 1.8의 `net.core.default_qdisc` 종류(Ubuntu 기본 `fq_codel`), N=1이면 그 default qdisc 하나. 이전에 직접 넣은 custom qdisc는 복원되지 않는다. unload rc=0, `/sys/fs/bpf`에 `vantage` 없음.
+- 실패 시: detach rc=4이면 남은 목록을 보고한다(native 드라이버에서 xdp 잔존은 X2, `setup.sh's root qdisc (mq 1:, per-queue fq) still present`는 root 삭제 실패). root가 `mq 0:`이 아니거나 자식이 default qdisc와 다르면 `tc qdisc show dev <IF>` 출력을 보고한다(X18).
 
 ## 6. 로컬에서 재현하지 못한 항목 체크리스트 (L4에서만 확인 가능)
 
@@ -279,8 +307,12 @@ DL 응답이 Vantage가 붙은 `<IF>`로 나가야 TX 페이서와 killswitch가
 | X1 | 새 clone 실행 권한 | 1.3 |
 | X2 | native XDP 지원 드라이버(ixgbe/i40e/mlx5 등)에서 detach 후 xdp 잔존 없음 | 5.2 |
 | X5 | 실 코어 경로에서 UE IP 노출(NAT 없음), 귀환 경로 | 1.4~1.7 |
-| X7 | 멀티큐 NIC(root `mq`)에서 setup.sh 재실행 rc=0, 공백 없음 | 3.3 |
-| X8 | native XDP NIC에서 generic attach 동작 / 수동 `xdpdrv` attach 시 exit 3 | 3.3 |
+| X7 | 멀티큐 NIC: 커널 기본 `mq 0:` → `mq 1:` + 큐별 fq 전환(첫 실행), 재실행 시 qdisc 무변경(handle 동일), 전환 순간 손실·링크 리셋 여부, `net.core.default_qdisc` 원복 | 3.3 |
+| X8 | native XDP: 지원 드라이버에서 `--xdp-mode native` rc=0과 `xdp` 표시, 미지원 시 rc=3·generic 복원, attach/detach 시 링크 플랩 시간. 남의 native XDP가 있으면 rc=3 | 3.3a |
+| X18 | detach 후 커널 기본 root 복원: 멀티큐 `mq 0:` + default_qdisc 자식, 단일 큐 default_qdisc | 5.2 |
+| X19 | `ethtool -L`로 채널을 늘린 뒤 **재실행 없이** 새 큐가 fq인지(`tc qdisc show`), 줄인 뒤 재실행 시 숨은 클래스를 다시 graft하는지(≥5.16), numtxqueues ≫ 사용 큐(예: mlx5 64+)에서 최초 setup 소요 시간·손실 | 3.3 재실행(선택) |
+| X21 | `sch_fq`가 builtin인 커널에서 모듈 검사 통과(rc=0) | 3.3 |
+| X20 | 큐가 여러 개(수십 개)인 NIC에서 큐별 `fq`의 EDT: 4.2 DL counter 판정, `-P 4` DL에서 UE 합계 cap | 4.2, 4.4a |
 | X12 | 22.04/24.04 설치 명령, `bpftool version` | 1.2 |
 | X14 | RSS 멀티큐 UL `-P 8` 과다 허용 | 4.4 |
 | X15 | BIG TCP 비활성(gro_max_size ≤ 65536), native XDP에서 rx_packets 의미 | 1.8, 4.3 |
