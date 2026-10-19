@@ -2,7 +2,7 @@
 
 Scripts that build and exercise Vantage-5G on a developer machine before it is installed on a physical service node. The goal is to catch defects at the cheapest level that can show them. Everything here runs the **same operator path as the top-level [README](../README.md)** (`make build` → `vantage-5G load` → `./setup.sh` → `set` → iperf3 → killswitch → `./detach.sh` → `unload`) against an emulated N6 link; a defect that would hit an operator following the README must also fail here.
 
-The scripts were developed on a macOS (x86_64) host. `l2-vbox.sh` uses `hdiutil`, so it runs on macOS only; `dev.sh`, `l1-docker.sh` and `run-tests.sh` are plain bash.
+The scripts were developed on a macOS (x86_64) host. `l2-vbox.sh` and `l3-vbox.sh` use `hdiutil`, so they run on macOS only; `dev.sh`, `l1-docker.sh` and `run-tests.sh` are plain bash.
 
 ## Contents
 
@@ -11,6 +11,7 @@ The scripts were developed on a macOS (x86_64) host. `l2-vbox.sh` uses `hdiutil`
 3. [dev.sh — one-off commands in the dev container](#3-devsh--one-off-commands-in-the-dev-container)
 4. [l1-docker.sh — L1 run in Docker](#4-l1-dockersh--l1-run-in-docker)
 5. [l2-vbox.sh — L2 run in a VirtualBox Ubuntu VM](#5-l2-vboxsh--l2-run-in-a-virtualbox-ubuntu-vm)
+5a. [l3-vbox.sh — L3 run: Open5GS + UERANSIM and a separate service node](#5a-l3-vboxsh--l3-run-open5gs--ueransim-and-a-separate-service-node)
 6. [Environment variables](#6-environment-variables)
 7. [Emulated topology (netns-topo.sh)](#7-emulated-topology-netns-toposh)
 8. [What run-tests.sh does](#8-what-run-testssh-does)
@@ -26,7 +27,7 @@ The scripts were developed on a macOS (x86_64) host. `l2-vbox.sh` uses `hdiutil`
 | **L0** | any host with Python 3.8+ | `python3 .claude/skills/vantage-boundary-check/scripts/contract_check.py .` | Static contracts: C struct ↔ Rust `#[repr(C)]`, map/program names, pin paths in `setup.sh`/`detach.sh`, Prometheus metric names ↔ top-level README. Exit 1 on any FAIL | Anything that runs |
 | **L1** | Docker (Docker Desktop kernel), privileged Ubuntu 24.04 container | `./testbed/l1-docker.sh` | Build, verifier, `load` (and idempotent re-load), attach, uplink RX policing with two concurrent sessions, killswitch, `set`/`reset` state handling, `unload` guard, `detach.sh` exit codes, upgrade from older pins | `sch_fq` is missing → `setup.sh`, downlink EDT pacing and the non-root / `ingress` checks are skipped |
 | **L2** | VirtualBox VM, stock Ubuntu 24.04 (`noble`, default) or 22.04 (`jammy`) | `./testbed/l2-vbox.sh` / `VT_RELEASE=jammy ./testbed/l2-vbox.sh` | All of L1 plus `setup.sh` (re-runs without a hook gap, re-run under load, non-root user, `ingress` refusal, missing `bpftool`, `--xdp-mode` switching, multi-queue `mq` layout with `VT_N6_TXQ`), downlink pacing, the top-level README §8 four concurrent sessions and a 4-flow-per-UE downlink cap check | Real 5G path (GTP, UPF NAT), physical NIC and its driver's native XDP / hardware queues |
-| **L3** | Open5GS + UERANSIM VM and service VM | not built yet | Real UE addresses through a core, NAT on/off | Physical NIC |
+| **L3** | Two VirtualBox VMs: `vantage-core` (Ubuntu 22.04, Open5GS reference install + UERANSIM) and `vantage-svc` (the L2 noble VM) joined by an internal-network N6 | `./testbed/l3-vbox.sh up`, then `./testbed/l3-vbox.sh test` | Real UE addresses through a 5G core (GTP-U, UPF, `ogstun`): the quickstart NAT failure mode, top-level README §3.2 (NAT exception A and B, `ip_forward`, return route, end-to-end check) and §8 (four sessions bound with `iperf3 -B <UE IP>`, counter/iperf verdicts), killswitch, on a virtio NIC instead of veth | Physical NIC, native XDP on a real driver, hardware queues, throughput above UERANSIM's userspace GTP capacity |
 | **L4** | Physical Ubuntu server | [`docs/install-runbook.md`](../docs/install-runbook.md) (run by hand) | Real NIC, driver, multi-queue, real core | — |
 
 Pick the lowest level that can show the change: contracts only → L0; BPF or CLI logic → L1; anything touching `setup.sh`, qdiscs or TX pacing → L2 (both releases, since iproute2 differs: 5.15 on 22.04 prints no program names). A level that was not run is not a pass.
@@ -38,6 +39,7 @@ Pick the lowest level that can show the change: contracts only → L0; BPF or CL
 | L0 | `python3` (3.8+) |
 | L1, `dev.sh` | Docker with privileged containers (Docker Desktop on macOS works). Internet on first run: the `vantage-dev` image installs Ubuntu packages and Rust (`testbed/docker/Dockerfile`) |
 | L2 | macOS host (x86_64; the VM uses the `amd64` Ubuntu cloud image), VirtualBox (`VBoxManage` on `PATH`), `curl`, `ssh`, `ssh-keygen`, `rsync`, `hdiutil`. Internet on first run (cloud image download, packages and Rust installed by cloud-init inside the VM). About 20 GB of disk per VM; the VM gets 4 vCPUs and 4 GB RAM |
+| L3 | As L2, plus the noble L2 VM (`vantage-svc`, created by `./testbed/l2-vbox.sh`), `jq` and `python3` on the host. Internet on first `up` (MongoDB repo, Open5GS PPA, UERANSIM from GitHub). `vantage-core` gets 4 vCPUs, 6 GB RAM, 20 GB disk; first `up` takes about 10–30 minutes (UERANSIM build) |
 
 ## 3. `dev.sh` — one-off commands in the dev container
 
@@ -98,6 +100,58 @@ Every `test` run then:
 4. prints `L2 results: <dir>` and exits with `run-tests.sh`'s exit code.
 
 The VM keeps running after a test (the next run starts faster); `stop` it when done. Two runs must not use the same VM at the same time (they share `/sys/fs/bpf/vantage` and the `vt-*` interfaces).
+
+## 5a. `l3-vbox.sh` — L3 run: Open5GS + UERANSIM and a separate service node
+
+```bash
+./testbed/l3-vbox.sh up         # create/provision vantage-core, add NIC2 to vantage-svc, start the RAN
+./testbed/l3-vbox.sh test       # scenarios (a) and (b) below; results in _workspace/l3-<ts>/
+./testbed/l3-vbox.sh ssh-core   # shell on vantage-core (ssh 127.0.0.1:2524)
+./testbed/l3-vbox.sh ssh-svc    # shell on vantage-svc  (ssh 127.0.0.1:2522)
+./testbed/l3-vbox.sh down       # stop gNB/UEs, power both VMs off
+./testbed/l3-vbox.sh delete     # delete vantage-core; remove vantage-svc's NIC2 (the VM itself stays)
+```
+
+Topology (mirrors the target deployment: the UPF host and the service node are different machines):
+
+```
+ vantage-core (Ubuntu 22.04)                                          vantage-svc (Ubuntu 24.04)
+ ┌─ netns ran ──────────────────────┐   ┌─ root ns ──────────────────────────┐
+ │ nr-ue x2: uesimtun0 10.45.0.2    │   │ AMF NGAP 10.100.0.5, UPF GTP-U .7    │      intnet "vantage-n6"
+ │           uesimtun1 10.45.0.3    │═══│ ogstun 10.45.0.1/16 -> routing ->    │ enp0s8 ═══════════ enp0s8 10.200.0.2/24
+ │ nr-gnb 10.100.0.2 (ran1)         │veth│ enp0s8 10.200.0.1/24 (UPF N6)       │                    ▲ Vantage XDP + tc/fq (<IF>)
+ └──────────────────────────────────┘   └────────────────────────────────────┘
+```
+
+- **vantage-core**: 4 vCPU / 6 GB, NIC1 NAT (internet, SSH), NIC2 internal network `vantage-n6` (MAC `08:00:27:a0:6e:01`). `testbed/vbox/core-user-data.tmpl` installs build dependencies; `testbed/vbox/core-provision.sh` (run by `up` over SSH, idempotent, log `/var/log/vantage-core-provision.log` and `_workspace/l3-core-provision.log`) follows the Open5GS quickstart: MongoDB 8.0 from `repo.mongodb.org`, `ppa:open5gs/latest` (not pinned — `latest` installs whatever the PPA has; the installed version is printed by `up` and recorded in every run's `env.txt`; 2.8.0 at the time of writing), two subscribers with `open5gs-dbctl add` (IMSI `999700000000001`/`…002`, the K/OPc of UERANSIM's `config/open5gs-ue.yaml`; `open5gs-dbctl` is not in the Ubuntu package, so it is fetched from `misc/db/` of the installed version's tag and checked with `sha256sum -c` against a hash pinned for 2.8.0 — another version needs `DBCTL_SHA256=<sha256>` for `up`), UERANSIM built from source (`UERANSIM_REF`, default `v3.2.7`, whose clone must resolve to commit `1d1e154f…`; another tag needs `UERANSIM_COMMIT=<sha>`) in `/opt/UERANSIM`. One deviation, taken from the quickstart's own "gNB on another host" diff: AMF NGAP and UPF GTP-U listen on `10.100.0.5` / `10.100.0.7` (a veth to netns `ran`) instead of `127.0.0.5` / `127.0.0.7`. The gNB and both UEs (`nr-ue -n 2`) run in netns `ran`, so UE addresses are not local to the UPF host and downlink really goes ogstun → UPF → GTP-U → gNB → UE.
+- **NAT state**: `testbed/vbox/core-ran.sh nat-reference` applies the quickstart's "UE WAN connectivity" commands verbatim (`sysctl -w net.ipv4.ip_forward=1`, `iptables -t nat -A POSTROUTING -s 10.45.0.0/16 ! -o ogstun -j MASQUERADE`, IPv6 likewise) and removes everything scenario (b) added. `test` starts and ends with it.
+- **vantage-svc**: the L2 noble VM. `up` powers it off once to add NIC2 (`vantage-n6`, MAC `08:00:27:a0:6e:02`) with `VBoxManage modifyvm`, then writes `/etc/netplan/60-vantage-n6.yaml` (10.200.0.2/24, matched by MAC). L2 ignores this NIC; the return route `10.45.0.0/16 via 10.200.0.1` exists only during an L3 test (L2's `netns-topo.sh` uses the same prefix on `vt-n6`).
+- RAN: `core-ran.sh up` (creates netns `ran`, restarts `open5gs-amfd`/`open5gs-upfd`/`open5gs-smfd`, starts `nr-gnb` and `nr-ue` as transient systemd units `vt-gnb`/`vt-ue`; logs with `journalctl -u vt-gnb -u vt-ue`). `test` runs it again if the two `uesimtunN` are missing (e.g. after a reboot of vantage-core).
+
+`test` steps (`summary.txt`, one `.log` per step; the commands are the documented ones from the top-level README and `docs/install-runbook.md` chapters 1 and 4):
+
+| Step | What |
+|---|---|
+| `build`, `load`, `setup.sh` | operator path on vantage-svc, `./setup.sh <IF>` on the virtio N6 NIC |
+| `ue-addr-8.1`, `nr-binder-in-build` | README §8.1 on the UE side: `uesimtunN` addresses in 10.45.0.0/16, `ip route get <SVC> from <UE>` → `dev uesimtunN`; `nr-binder` and `libdevbnd.so` in UERANSIM `build/` |
+| `a-n6-sees-upf-ip-only` | (a) quickstart NAT: `tcpdump` on `<IF>` during `ping -I uesimtun0` shows only `10.200.0.1`, and the README §3.2 end-to-end filter `net 10.45.0.0/16` captures nothing |
+| `a-policy-never-matches` | (a) with `set` 2/2 Mbps for both UEs, `iperf3 -B <UE>` UL and DL run far above the cap and `stats` has no UE rows |
+| `b1-nat-exception-A` | README §3.2 (1) method A (`-I POSTROUTING 1 … -d <SVC_NET> -j ACCEPT`), ACCEPT listed above MASQUERADE, `conntrack -D` |
+| `b2-ip-forward` | README §3.2 (2): sysctl.d file, `sysctl --system`, `-P FORWARD ACCEPT`, `ip route get <SVC>` |
+| `b3-no-route-replies-lost` | without (3): requests from the UE IP reach `<IF>`, no reply leaves it (README's diagnosis "fix (3)") |
+| `b3-return-route`, `b-e2e-ue-ip-on-n6` | README §3.2 (3) and "Check end to end": request **and** reply with the UE IP on `<IF>` |
+| `b-baseline-no-policy` | four sessions without policy = capacity of the UERANSIM path; picks the caps (README's 10/20 and 3/5 if every session ≥ 60 Mbps, else 4/6 and 2/3; override `VT_L3_CAPS="A_rx A_tx B_rx B_tx"`) |
+| `set-A`, `set-B`, `iperf-verdict`, `counter-verdict` | README §8.2–8.5: four concurrent `iperf3 -B <UE IP>` sessions (run directory `run/`, `spec.csv`, `stats_t1/t2.txt` at 5 s and 25 s) |
+| `b-stats-has-ue-rows`, `b-no-session-over-cap` | functional checks: both UE addresses counted; no row above cap +10% in either verdict |
+| `b-dl-udp-pacer-control`, `b-dl-kernel-fq-control` | evidence for an under-cap DL: UDP DL at 2× A's cap (counter must be within ±10%), and the kernel's `fq maxrate` on the same NIC (recorded) |
+| `iperf-verdict-class` (INFO) | written only when `iperf-verdict` failed: "environment" if no row is over cap, `tx_drops` are 0 and the UDP control passed |
+| `killswitch` | `--tx-mbps 0` for UE-B: `(killswitch: DL blocked)`, `ping -I uesimtun1` fails, UE-A pings, `iperf3 -R` for UE-B cannot connect (cap-0 verdict), TX_DROPS rises; restore |
+| `b1-nat-exception-B` | README §3.2 (1) method B (replace the MASQUERADE rule with `! -d <SVC_NET>`): UE IP visible again |
+| `detach`, `unload` | `./detach.sh <IF>`, `vantage-5G unload` |
+
+Cleanup: an exit trap (normal end, failure, Ctrl-C, ssh drop) kills background captures, runs `detach.sh <IF>` and `unload`, removes the return route and iperf3/tcpdump on vantage-svc, and puts vantage-core back to the quickstart NAT state (`nat-reference-end.log`). `killswitch` restores UE-B's policy even when one of its checks fails. `test` starts both VMs if they are off (e.g. after `down`). `VT_L3_FORCE_KS_FAIL=1` makes the killswitch step fail on purpose (harness self-test).
+
+Result directory `_workspace/l3-<ts>/`: `summary.txt`, `env.txt` (versions, addresses, host `uptime`), `commit.txt`, per-step logs, `*.tcpdump.txt`/`*.ue.txt` captures, `baseline/` and `run/` (iperf3 JSON, `spec.csv`, `stats_*.txt`, `rates.txt`, `uptime.txt`), `verdict.txt`, `verdict_counters.txt`, `tx_drops.txt`, `ctl_*` control runs.
 
 ## 6. Environment variables
 
@@ -227,6 +281,7 @@ python3 .claude/skills/vantage-testbed/scripts/counter_verdict.py $d/spec.csv $d
 - **No `sch_fq` in Docker Desktop's kernel (L1).** EDT pacing needs a root `fq` qdisc, so `setup.sh` cannot run and downlink pacing is untestable; `run-tests.sh` detects this (`has_fq=0` in `env.txt`) and attaches without fq. Use L2.
 - **Throughput depends on the host.** Both levels run iperf3 on the same machine as the datapath. A busy host (other VMs, builds) makes sessions fall **under** their caps; counter and iperf verdicts then fail although the datapath is fine. Check host load before trusting an under-cap result (`uptime`; on macOS also the VM's `VBoxHeadless` CPU in Activity Monitor). Over-cap results are not caused by load.
 - **Emulated N6 only.** veth pairs, no GTP and no real UPF. `VT_XDP_MODE=native` exercises the veth driver's native XDP and `VT_N6_TXQ` gives veth software TX queues (so the `mq` + per-queue `fq` layout and cross-queue pacing are tested), but a physical NIC driver's native XDP support, its hardware queues and IRQ/XPS mapping, BIG TCP / GRO sizes and the core's NAT behaviour are only checked on the physical server (runbook §6).
+- **L3: locally generated TCP on the virtio N6 NIC under-delivers with any shaper.** With iperf3 servers on vantage-svc itself (as README §8 does), a single TCP DL flow paced to a few Mbps reached about 50–85% of the cap in our runs, and the kernel's `fq maxrate` and `tbf` on the same NIC do the same or worse; UDP DL and TCP forwarded through vantage-svc (likely cause: TCP small-queue back-pressure waits for the VM NIC's TX completions; not seen on L2's veth) reach the cap through the same pacer. `b-dl-udp-pacer-control` and `b-dl-kernel-fq-control` record this in every run. The four-session run usually lands within tolerance; a DL row a few percent under is environment when those controls agree. UERANSIM's userspace GTP-U limits the path to tens of Mbps per session under load, hence the small caps.
 - **`unload` guard is per network namespace.** Attachments inside the UE/core namespaces would not be seen; the tests attach only in the service-node namespace.
 - **`VT_*` on L1.** `l1-docker.sh` forwards them, but without `sch_fq` and without an `ubuntu` user the `setup.sh`-related ones (`VT_SETUP_AS`, `VT_NONROOT_USER`, the `--xdp-mode` steps) only take effect on L2.
 
@@ -253,6 +308,10 @@ python3 .claude/skills/vantage-testbed/scripts/counter_verdict.py $d/spec.csv $d
 | `dev.sh` | One-off command in the dev container |
 | `l1-docker.sh` | L1: `run-tests.sh` in a privileged container |
 | `l2-vbox.sh` | L2: create/start the VirtualBox VM, sync the tree, run `run-tests.sh`, fetch results; `ssh` / `stop` / `delete` |
+| `l3-vbox.sh` | L3: `up` / `test` / `ssh-core` / `ssh-svc` / `down` / `delete` (§5a) |
+| `vbox/vm-lib.sh` | VirtualBox helpers shared by `l2-vbox.sh` and `l3-vbox.sh` (create VM from the cloud image, wait for SSH/cloud-init, power off, delete) |
+| `vbox/core-user-data.tmpl`, `vbox/core-provision.sh`, `vbox/core-ran.sh` | L3 core VM: cloud-init, Open5GS/MongoDB/UERANSIM provisioning, RAN netns and quickstart NAT state |
+| `vbox/l3-test.sh` | Body of `l3-vbox.sh test` |
 | `run-tests.sh` | Test body shared by L1 and L2 (§8) |
 | `netns-topo.sh` | Emulated UE / core / N6 topology (§7) |
 | `docker/Dockerfile` | `vantage-dev` image: Ubuntu 24.04, clang/llvm/libbpf, linux-tools, iproute2, iptables, iperf3, tcpdump, Rust (rustfmt, clippy) |

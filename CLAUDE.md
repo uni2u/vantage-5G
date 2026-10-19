@@ -21,3 +21,4 @@
 | 2026-10-19 | 병렬 엔지니어의 L2 VM 동시 사용 금지(VM 분배 규칙) | skills/vantage-orchestrator | 3차 작업에서 datapath·control-plane이 같은 VM 핀을 동시에 사용해 실험 오염 가능성 발생 |
 | 2026-10-19 | 처리량 판정에 counter 기반 보조 판정(counter_verdict.py), 회귀 단계(D4/D6/D7/D16/D25/D26/업그레이드) 추가, L4 설치 런북을 docs/로 | testbed/, skills/vantage-testbed, docs/ | 3·4차 결함 수정 검증, X3 B안(cap=L2 전체 바이트) |
 | 2026-10-19 | L2 VM 격리 규칙 강화(라우팅·sysctl·bpffs 공유 → 테스트 중 VM 접근 금지) | skills/vantage-orchestrator | 6차에서 별도 veth를 쓴 엔지니어의 10.45.1.0/24 주소가 테스트 경로를 가로채 실행 1회 무효 |
+| 2026-10-20 | L3 테스트베드(Open5GS 레퍼런스 + UERANSIM, UPF/서비스 노드 분리) 구현, vantage-testbed 스킬 L3 갱신 | testbed/, skills/vantage-testbed | 로드맵 2번: 물리 서버 전 5G 경로·NAT 절차 로컬 검증 |

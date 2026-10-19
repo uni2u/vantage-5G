@@ -3,6 +3,7 @@
 - 대상 커밋: `main`의 `d80ee7b` 이후. 아래 `<COMMIT>`을 실제로 받은 해시로 바꾼다. `d80ee7b`에는 4.2의 판정 스크립트 `counter_verdict.py`가 들어 있다(`311ee1c`에는 없음).
 - 로컬 근거: 로컬 L1/L2 실행은 `ddc00c8` + 미커밋 변경 상태의 작업 트리에서 했다(당시 결과의 `commit.txt`는 HEAD만 기록해 `ddc00c8`로 남아 있다). 그 미커밋 변경이 이후 `311ee1c`로 커밋되었고, `311ee1c`와 `d80ee7b`의 제품 코드(`*.c`, `src/`, `setup.sh`, `detach.sh`, `Makefile`)는 같다(`git diff --stat 311ee1c d80ee7b`). 결과: L1 Docker와 L2 VirtualBox(Ubuntu 22.04)에서 전 단계 PASS. L2 24.04는 기능 단계 전부 PASS, 처리량은 호스트 부하로 판정 보류. 상세 보고서는 개발자 로컬 기록이며 저장소에는 없다.
 - `setup.sh --xdp-mode`와 멀티큐(root `mq` + 큐별 `fq`) 처리(3.3, 3.3a, 4.4a, 5.2)는 브랜치 `feat/setup-mq-xdpmode`의 변경이다. 이 기능이 들어간 커밋을 `<COMMIT>`으로 쓴다. 로컬 근거: L2 VirtualBox(Ubuntu 22.04·24.04)의 veth N6에서 TX 큐 1·2·4개, generic·native 조합으로 확인했다.
+- L3 로컬 테스트베드(`testbed/l3-vbox.sh`: Open5GS 2.8.0 레퍼런스 설치 + UERANSIM v3.2.7 VM과 서비스 노드 Ubuntu 24.04 VM을 별도 N6로 연결)에서 문서 명령 그대로 실행해 확인한 범위: 1.4(방법 A·B, conntrack 삭제), 1.5(FORWARD 정책이 `ACCEPT`인 경우: sysctl.d 파일, `sysctl --system`, `ip route get <SVC>`), 1.6(`ip route add`/`ip route get`), 1.7(종단 확인과 귀환 경로가 없을 때의 진단), 4.0(`uesimtunN` 확인), 4.1(정책 `set`·`list`; D26 같은 값 재적용은 L2에서만), 4.2~4.3(`-B` 바인딩 4세션, stats 스냅샷과 두 판정, 측정 직후 상태), 4.5 killswitch. **확인하지 않은 것**: 1.5의 `-P FORWARD DROP` 분기, 1.5a 영구화(ufw·iptables-persistent), 1.6의 netplan 영구화, 4.4/4.4a(멀티큐), 4.5 D4 — 6장과 함께 L4에서 확인한다.
 - 형식: 각 단계는 **명령 / 기대 결과 / 실패 시** 순서다.
 - 기호(예시 값은 README §3.2와 같다. 실제 값으로 바꾼다):
 
@@ -223,7 +224,7 @@ DL 응답이 Vantage가 붙은 `<IF>`로 나가야 TX 페이서와 killswitch가
   ip route get <SVC> from <UE_A>
   ip route get <SVC> from <UE_B>
   ```
-- 기대: PDU 세션마다 `uesimtunN`이 하나씩 있고 주소가 `<UE_NET>` 안에 있다. 이 주소로 런북 전체의 `<UE_A>`, `<UE_B>`(`spec.csv`의 `ue_ip` 포함)를 바꾼다. `ip route get … from <UE_x>`가 `dev uesimtunN`을 출력한다.
+- 기대: PDU 세션마다 `uesimtunN`이 하나씩 있고 주소가 `<UE_NET>` 안에 있다(UERANSIM 기본 설정이면 `10.45.0.2/24`처럼 `/24`로 표시된다. UE IP는 `/24`를 뺀 주소. Open5GS 레퍼런스 설치는 등록 순서대로 `10.45.0.2`, `10.45.0.3`, …을 준다 — L3 로컬 확인). 이 주소로 런북 전체의 `<UE_A>`, `<UE_B>`(`spec.csv`의 `ue_ip` 포함)를 바꾼다. `ip route get … from <UE_x>`가 `dev uesimtunN`을 출력한다.
 - 실패 시: `uesimtun`이 없으면 UE가 등록·PDU 세션 수립을 못 한 것이다(UERANSIM `nr-ue` 로그 확인). `ip route get … from`이 `uesimtunN`이 아닌 LAN NIC를 출력하면 `-B`만으로는 5G 경로를 타지 않는다 — 4.2에서 UERANSIM `build/`의 `nr-binder`를 쓴다.
 
 ### 4.1 정책
@@ -235,7 +236,7 @@ DL 응답이 Vantage가 붙은 `<IF>`로 나가야 TX 페이서와 killswitch가
   ```
   (업그레이드였다면 2.1의 정책도 모두 다시 set한다.)
 - 기대: `[+] policy set: UE <UE_A> rx=10 Mbps tx=20 Mbps` 등이 출력되고, `list`에 두 UE가 나온다.
-- 실패 시: `open pinned ue_policy_map (run `vantage-5G load` first; needs root)`이면 3.2(load)와 `sudo`를 확인한다. `invalid value … for '--ue-ip <UE_IP>'`(rc=2)이면 4.0의 주소를 `/32` 없이 넣었는지 확인한다.
+- 실패 시: `open pinned ue_policy_map (run `vantage-5G load` first; needs root)`이면 3.2(load)와 `sudo`를 확인한다. `invalid value … for '--ue-ip <UE_IP>'`(rc=2)이면 4.0의 주소를 접두사 길이 없이(`10.45.0.2/24`가 아니라 `10.45.0.2`) 넣었는지 확인한다.
 - D26 확인: 같은 명령을 한 번 더 실행한다(`set --ue-ip <UE_A> --rx-mbps 10 --tx-mbps 20`). 출력 끝에 `(unchanged; rx/tx state kept)`가 붙어야 한다 — 같은 값 재적용은 정책만 덮어쓰고 RX 토큰버킷·TX EDT 상태를 유지한다(주기적 재적용에도 버스트/백로그 망각 없음). 값이 바뀌면 이 문구가 없고 상태가 초기화된다. 상태를 강제로 초기화하려면 `reset` 후 `set`한다. 운영 스크립트가 주기적으로 `set`을 재적용한다면 그 동작이 이 의미를 전제로 하는지 확인한다.
 
 ### 4.2 서버와 클라이언트
@@ -249,7 +250,7 @@ DL 응답이 Vantage가 붙은 `<IF>`로 나가야 TX 페이서와 killswitch가
   iperf3 -c <SVC> -B <UE_B> -p 5204 -t 30 -R -J > b_dl.json &
   wait
   ```
-  4.0에서 `ip route get … from`이 `uesimtunN`이 아니었다면 `-B` 대신 UERANSIM `build/` 디렉토리의 `nr-binder`로 실행한다(예: `./nr-binder <UE_A> iperf3 -c <SVC> -p 5201 -t 30 -J > ~/vt-l4/a_ul.json &`).
+  4.0에서 `ip route get … from`이 `uesimtunN`이 아니었다면 `-B` 대신 UERANSIM `build/` 디렉토리의 `nr-binder`로 실행한다. `nr-binder`는 `./libdevbnd.so`를 상대 경로로 preload하므로 `build/`에서 실행한다(예: `cd ~/UERANSIM/build && ./nr-binder <UE_A> iperf3 -c <SVC> -p 5201 -t 30 -J > ~/vt-l4/a_ul.json &`).
 - 기대(실행 중): [서비스 노드] `sudo ./target/release/vantage-5G stats`에 `<UE_A>`, `<UE_B>` 행이 있고 rx_bytes/tx_bytes가 증가한다.
 - 실패 시: `stats`에 UE 행이 없으면 1.7(NAT)과 바인딩을 다시 확인한다. iperf3가 `unable to connect`이면 1.6(귀환 경로)·1.5(포워딩)를 확인한다.
 - 네 세션을 **같은 순간**에 시작한다.

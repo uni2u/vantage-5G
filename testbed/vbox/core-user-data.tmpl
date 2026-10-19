@@ -1,0 +1,34 @@
+#cloud-config
+# L3 core VM (vantage-core, Ubuntu 22.04): Open5GS reference install + UERANSIM.
+# @SSH_PUBKEY@ and @HOSTNAME@ are substituted by testbed/vbox/vm-lib.sh.
+# Only the base OS and build dependencies are installed here; Open5GS, MongoDB,
+# subscribers and UERANSIM come from testbed/vbox/core-provision.sh (run by
+# testbed/l3-vbox.sh over ssh, idempotent, log in /var/log/vantage-core-provision.log).
+hostname: @HOSTNAME@
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - @SSH_PUBKEY@
+ssh_pwauth: false
+package_update: true
+packages:
+  - gnupg
+  - curl
+  - git
+  - make
+  - gcc
+  - g++
+  - cmake
+  - libsctp-dev
+  - lksctp-tools
+  - iproute2
+  - iptables
+  - iperf3
+  - tcpdump
+  - iputils-ping
+  - jq
+  - python3
+  - rsync
+  - software-properties-common
