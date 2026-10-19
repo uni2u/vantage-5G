@@ -175,9 +175,10 @@ fn cmd_unload() -> Result<()> {
         println!("[i] Nothing to remove ({} does not exist)", BPF_PIN_DIR);
         return Ok(());
     }
-    // Remove file pins first, then the directory. Detachment (XDP/tc) must
-    // already have been undone; otherwise the kernel keeps the objects alive
-    // and the .rmdir will just fail harmlessly.
+    // Remove file pins first, then the directory. Run detach.sh first:
+    // bpffs unlink/rmdir succeed even while programs are still attached, and
+    // an attached program then keeps running with its (now unpinned) maps,
+    // which the CLI can no longer reach.
     for entry in std::fs::read_dir(root)? {
         let p = entry?.path();
         let _ = std::fs::remove_file(&p);
@@ -200,20 +201,30 @@ fn load_and_pin(obj_file: &str, prog_name: &str) -> Result<()> {
         return Ok(());
     }
 
+    // All maps in both objects are declared LIBBPF_PIN_BY_NAME. With
+    // pin_root_path set, libbpf computes each map's pin path at open time
+    // as <BPF_PIN_DIR>/<map name>, and during load() either re-uses an
+    // already-pinned map at that path (the shared ue_policy_map/ue_stats_map
+    // for the second object) or creates the map and pins it there. No manual
+    // bpf_map__pin() is needed; pinning to a different path would fail with
+    // -EINVAL ("already has pin path ... different from ...").
     let open = ObjectBuilder::default()
+        .pin_root_path(BPF_PIN_DIR)
+        .with_context(|| format!("pin_root_path {}", BPF_PIN_DIR))?
         .open_file(obj_file)
         .with_context(|| format!("open {}", obj_file))?;
     let mut obj = open.load()
         .with_context(|| format!("load {} (verifier/BTF check)", obj_file))?;
 
-    // Pin all maps declared with LIBBPF_PIN_BY_NAME. libbpf handles the
-    // shared-map case: the second object sees an already-pinned map and
-    // re-uses it instead of creating a new one.
+    // Sanity check: every map this object declares must now be pinned under
+    // BPF_PIN_DIR (catches a map that lost its LIBBPF_PIN_BY_NAME attribute).
     for map_name in [MAP_POLICY, MAP_STATS, MAP_RXST, MAP_TXTS] {
-        if let Some(m) = obj.map_mut(map_name) {
-            let p = pin_path(map_name);
-            if !p.exists() {
-                m.pin(&p).with_context(|| format!("pin map {}", map_name))?;
+        if let Some(m) = obj.map(map_name) {
+            let want = pin_path(map_name);
+            let got = m.get_pin_path().map(PathBuf::from);
+            if !m.is_pinned() || got.as_deref() != Some(want.as_path()) {
+                bail!("map {} not pinned at {} (pin path: {:?}); is it LIBBPF_PIN_BY_NAME?",
+                      map_name, want.display(), got);
             }
         }
     }
