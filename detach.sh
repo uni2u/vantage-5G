@@ -12,6 +12,7 @@ if [[ -z "${IFACE}" ]]; then
 fi
 
 echo "=== 1. remove tc egress filter ==="
+# Removes every egress filter, including setup.sh's Vantage pacer (pref 1 handle 1).
 sudo tc filter del dev "${IFACE}" egress 2>/dev/null || true
 
 echo "=== 2. detach XDP ==="

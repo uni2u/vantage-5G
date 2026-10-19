@@ -83,10 +83,15 @@ sudo ./setup.sh enp0s3
 
 What `setup.sh` does:
 
+0. Pre-flight: refuses (exit 3, nothing changed) if the NIC already has an XDP program in native/offload mode, a generic XDP program that is not identifiable as Vantage, a non-Vantage egress filter at pref 1, or a classic `ingress` qdisc. Programs are identified by id/tag against the pinned programs (via `bpftool` if usable, otherwise a short-lived dummy probe interface), so this works with iproute2 5.15 (Ubuntu 22.04), which prints no program names.
 1. `tc qdisc replace dev <iface> root fq` — required for `skb->tstamp` pacing.
-2. `tc qdisc add dev <iface> clsact` — hook point for the tc-bpf egress filter.
-3. `ip link set dev <iface> xdpgeneric pinned /sys/fs/bpf/vantage/vantage_rx_policer`
-4. `tc filter add dev <iface> egress bpf da pinned /sys/fs/bpf/vantage/vantage_tx_pacer`
+2. `tc qdisc add dev <iface> clsact` only if missing — hook point for the tc-bpf egress filter (never deleted by `setup.sh`).
+3. `ip -force link set dev <iface> xdpgeneric pinned /sys/fs/bpf/vantage/vantage_rx_policer` — atomic replace on re-run.
+4. `tc filter replace dev <iface> egress protocol all pref 1 handle 1 bpf da pinned /sys/fs/bpf/vantage/vantage_tx_pacer` — atomic replace on re-run; stale Vantage pacers at other prefs (left by older `setup.sh`) are removed afterwards.
+5. Verifies the result (generic XDP, root `fq`, `clsact`, exactly one Vantage egress filter, attached program ids equal to the pinned ones) and exits 4 if it is not as expected.
+
+Re-running `setup.sh` on an attached NIC is safe: neither hook is removed at any point.
+One exception refuses instead (exit 3, nothing changed): on iproute2 < 6 without a working `bpftool`, after `unload`/`load` of a *rebuilt* `.o` while attached, the old program can no longer be identified as Vantage. Run `sudo ./detach.sh <iface>` first in that case, or install `linux-tools-$(uname -r)`.
 
 ## 6. Set / reset / inspect per-UE policy
 
