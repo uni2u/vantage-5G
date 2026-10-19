@@ -1,0 +1,36 @@
+#cloud-config
+# L2 service-node VM (stock Ubuntu kernel => sch_fq available), noble or jammy.
+# @SSH_PUBKEY@ and @HOSTNAME@ are substituted by testbed/l2-vbox.sh.
+# jammy: /usr/sbin/bpftool is a wrapper that needs linux-tools-$(uname -r) (runcmd).
+hostname: @HOSTNAME@
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - @SSH_PUBKEY@
+ssh_pwauth: false
+package_update: true
+packages:
+  - build-essential
+  - clang
+  - llvm
+  - libbpf-dev
+  - libelf-dev
+  - zlib1g-dev
+  - pkg-config
+  - linux-tools-common
+  - linux-tools-generic
+  - iputils-ping
+  - curl
+  - iproute2
+  - iptables
+  - iperf3
+  - tcpdump
+  - jq
+  - python3
+  - rsync
+runcmd:
+  - [bash, -c, "apt-get install -y linux-tools-$(uname -r) || true"]
+  - [bash, -c, "HOME=/root curl -sSf https://sh.rustup.rs | HOME=/root sh -s -- -y --profile minimal"]
+  - [bash, -c, "ln -sf /root/.cargo/bin/cargo /usr/local/bin/cargo && ln -sf /root/.cargo/bin/rustc /usr/local/bin/rustc"]
