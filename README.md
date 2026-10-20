@@ -486,7 +486,7 @@ rate(vantage_ue_tx_bytes_total[5s]) * 8 / 1e6
 rate(vantage_ue_rx_drops_total[10s])
 ```
 
-A Grafana dashboard will land in `dashboards/` once the test bed is producing traffic; the exporter is stable and unlikely to change further.
+Grafana dashboard (throughput vs cap, ±10 % band, drops, policy/killswitch table): [`dashboards/vantage-5g.json`](dashboards/vantage-5g.json), import and scrape setup in [`dashboards/README.md`](dashboards/README.md).
 
 ## 8. Verification — Phase 1 completion criteria
 
