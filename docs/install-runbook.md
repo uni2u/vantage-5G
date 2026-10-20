@@ -4,6 +4,7 @@
 - 로컬 근거: 로컬 L1/L2 실행은 `ddc00c8` + 미커밋 변경 상태의 작업 트리에서 했다(당시 결과의 `commit.txt`는 HEAD만 기록해 `ddc00c8`로 남아 있다). 그 미커밋 변경이 이후 `311ee1c`로 커밋되었고, `311ee1c`와 `d80ee7b`의 제품 코드(`*.c`, `src/`, `setup.sh`, `detach.sh`, `Makefile`)는 같다(`git diff --stat 311ee1c d80ee7b`). 결과: L1 Docker와 L2 VirtualBox(Ubuntu 22.04)에서 전 단계 PASS. L2 24.04는 기능 단계 전부 PASS, 처리량은 호스트 부하로 판정 보류. 상세 보고서는 개발자 로컬 기록이며 저장소에는 없다.
 - `setup.sh --xdp-mode`와 멀티큐(root `mq` + 큐별 `fq`) 처리(3.3, 3.3a, 4.4a, 5.2)는 브랜치 `feat/setup-mq-xdpmode`의 변경이다. 이 기능이 들어간 커밋을 `<COMMIT>`으로 쓴다. 로컬 근거: L2 VirtualBox(Ubuntu 22.04·24.04)의 veth N6에서 TX 큐 1·2·4개, generic·native 조합으로 확인했다.
 - L3 로컬 테스트베드(`testbed/l3-vbox.sh`: Open5GS 2.8.0 레퍼런스 설치 + UERANSIM v3.2.7 VM과 서비스 노드 Ubuntu 24.04 VM을 별도 N6로 연결)에서 문서 명령 그대로 실행해 확인한 범위: 1.4(방법 A·B, conntrack 삭제), 1.5(FORWARD 정책이 `ACCEPT`인 경우: sysctl.d 파일, `sysctl --system`, `ip route get <SVC>`), 1.6(`ip route add`/`ip route get`), 1.7(종단 확인과 귀환 경로가 없을 때의 진단), 4.0(`uesimtunN` 확인), 4.1(정책 `set`·`list`; D26 같은 값 재적용은 L2에서만), 4.2~4.3(`-B` 바인딩 4세션, stats 스냅샷과 두 판정, 측정 직후 상태), 4.5 killswitch. **확인하지 않은 것**: 1.5의 `-P FORWARD DROP` 분기, 1.5a 영구화(ufw·iptables-persistent), 1.6의 netplan 영구화, 4.4/4.4a(멀티큐), 4.5 D4 — 6장과 함께 L4에서 확인한다.
+- 설치 경로는 두 가지다(README §5, §5a). **(가) 수동**: 3.2 `load` → 3.3 `setup.sh` → 4.1 `set`. 단계마다 출력이 바로 보여 첫 설치·측정·진단에 맞다. 재부팅하면 핀·attach·정책이 모두 사라진다. **(나) systemd 서비스**: 3.6 `install.sh` → `/etc/vantage-5g/` 설정 → `systemctl start`. 부팅마다 load → `apply --replace`(policies.conf) → `setup.sh` 순으로 자동 실행된다. 권장 순서: (가)로 3~5장을 끝까지 한 번 측정한 뒤 3.6으로 (나)를 설치하고, 3.6.5 재부팅 확인 후 필요하면 4장을 서비스 상태에서 다시 측정한다. (나)의 로컬 근거: `testbed/l2-systemd.sh`(L2 VM에서 설치 → 재부팅 → 확인 → 제거, 테스트 N6는 systemd-networkd veth). Ubuntu 24.04(systemd 255)에서 현재 유닛(monitor `Wants=`, 하드닝, `--allow-empty`, 잠금 포함)으로 pre 3/3, post 34/34, cleanup 4/4 PASS. Ubuntu 22.04(systemd 249)는 그 이전 유닛(monitor `Requires=`)으로 pre 3/3, post 26/26, cleanup 4/4 PASS였고 현재 유닛으로는 재검증 예정이다. 두 실행 모두 VM 타이머 열화(X10) 상태라 트래픽 처리량은 기능 확인용이다.
 - 형식: 각 단계는 **명령 / 기대 결과 / 실패 시** 순서다.
 - 기호(예시 값은 README §3.2와 같다. 실제 값으로 바꾼다):
 
@@ -164,6 +165,18 @@ DL 응답이 Vantage가 붙은 `<IF>`로 나가야 TX 페이서와 killswitch가
 - 실패 시: detach가 rc=4이면 남은 훅 목록을 보고 sudo/root로 다시 실행한다. unload가 `Vantage programs are still attached`이면 출력된 각 인터페이스에 `detach.sh`를 실행한다. 다른 netns에 붙은 것은 가드가 보지 못한다(X16).
 - 이어서 3장(load → setup)을 진행하고, 4.1에서 2.1의 정책을 모두 다시 `set`한다.
 
+### 2.4 서비스(3.6)로 설치된 서버의 업그레이드
+- 명령:
+  ```bash
+  sudo vantage-5G export > /tmp/policies.conf && diff /tmp/policies.conf /etc/vantage-5g/policies.conf   # CLI로만 바꾼 정책 확인
+  git fetch && git checkout <COMMIT> && make build
+  sudo ./install.sh install 2>&1 | tail -4; echo rc=${PIPESTATUS[0]}
+  sudo systemctl restart vantage-5g; systemctl is-active vantage-5g vantage-5g-monitor
+  journalctl -u vantage-5g -n 20 --no-pager | tee ~/vt-l4/2.4-restart.txt
+  ```
+- 기대: diff가 주석 줄만 다르면 파일이 최신이다(다르면 `sudo mv /tmp/policies.conf /etc/vantage-5g/policies.conf`로 저장할지 결정). install rc=0, 출력에 `vantage-5g.service is running the previous version; to switch …` 안내. restart는 detach → unload → load → apply → setup이므로 맵 정의가 바뀐 업그레이드(2.2의 거부)도 이것으로 끝난다. `active` 두 줄, journal에 새 load와 `applied … (--replace)`.
+- 실패 시: restart 후 `failed`이면 3.6.3의 실패 시 표로 단계를 판정한다. stop 단계 실패는 3.6.6의 실패 시를 따른다.
+
 ## 3. 빌드 → load → attach
 
 ### 3.1 빌드
@@ -214,6 +227,96 @@ DL 응답이 Vantage가 붙은 `<IF>`로 나가야 TX 페이서와 killswitch가
 - 기대: rc=2와 `linux-tools-$(uname -r)` 안내가 나온다. attach 상태는 그대로다(xdp id 불변).
 - 실패 시: 상태가 바뀌었으면 즉시 3.3을 다시 실행하고 보고한다.
 
+### 3.6 [선택 (나)] systemd 서비스로 설치 (README §5a)
+3.1의 빌드가 끝난 상태에서 진행한다. 3.2~3.3으로 이미 수동으로 붙여 둔 상태여도 된다(`load`는 멱등, `setup.sh` 재실행은 안전). 서비스는 **policies.conf가 기준**이다: 시작·reload·재부팅마다 `apply --replace`가 파일에 없는 UE의 정책을 지운다. 그래서 CLI(`set`)로 넣은 정책을 먼저 파일로 저장한다(3.6.2).
+
+원격 SSH가 `<IF>`를 거치지 않는지 먼저 확인한다(3.6.5 재부팅, native XDP 링크 리셋).
+
+#### 3.6.1 install
+- 명령:
+  ```bash
+  sudo ./install.sh install --enable 2>&1 | tee ~/vt-l4/3.6.1-install.txt; echo rc=${PIPESTATUS[0]}
+  systemctl is-enabled vantage-5g vantage-5g-monitor; ls -l /usr/local/bin/vantage-5G /usr/local/lib/vantage-5g /etc/vantage-5g
+  sudo ./install.sh install 2>&1 | tail -4; echo rc=${PIPESTATUS[0]}     # 재실행: 설정 보존 확인
+  ```
+- 기대: 첫 실행 rc=0. `=== 1. /usr/local/lib/vantage-5g ===` 다음 줄에 `vantage-5G 0.2.0`, `/usr/local/bin/vantage-5G -> /usr/local/lib/vantage-5g/vantage-5G`, `vantage-5g.env created from the example`, `policies.conf created from the example`, `=== 5. enable ===`, `[+] Vantage-5G installed.`, `[!] set IFACE= in /etc/vantage-5g/vantage-5g.env`. 예시 env는 `MONITOR_ARGS=--bind 127.0.0.1`이라 `MONITOR_ARGS … has no --bind` 경고는 나오지 않는다(기존 env를 유지한 재설치에서 `--bind`가 없으면 나온다). `is-enabled`가 `enabled` 두 줄. 재실행도 rc=0이고 출력에 `vantage-5g.env exists (kept)`, `policies.conf exists (kept)`가 있다.
+- 실패 시: rc=2와 `missing in <저장소>: …`이면 3.1(`make build`)을 확인한다. rc=1과 `run as root`이면 `sudo`로 실행한다. `[!] /usr/local/bin/vantage-5G is a regular file`이면 기록한다(그 파일은 건드리지 않음). 이 런북의 서비스 단계에서는 `/usr/local/lib/vantage-5g/vantage-5G`를 쓴다.
+
+#### 3.6.2 설정과 정책 파일
+- 명령:
+  ```bash
+  # 지금 맵에 있는 정책(수동 경로에서 set한 것)을 파일로 저장. 임시 파일 → mv (export 실패 시 빈 파일 방지)
+  sudo vantage-5G export | tee ~/vt-l4/3.6.2-export.txt
+  sudo vantage-5G export > /tmp/policies.conf && sudo mv /tmp/policies.conf /etc/vantage-5g/policies.conf
+  sudoedit /etc/vantage-5g/vantage-5g.env     # IFACE=<IF>, XDP_MODE=generic|native(3.3a 결과), MONITOR_ARGS=
+  sudoedit /etc/vantage-5g/policies.conf      # 필요하면 <UE_IPv4> <rx_mbps> <tx_mbps> 줄 편집
+  grep -vE '^\s*(#|$)' /etc/vantage-5g/vantage-5g.env /etc/vantage-5g/policies.conf | tee ~/vt-l4/3.6.2-config.txt
+  ```
+  아무것도 load되지 않은 상태라면 `export`는 `open pinned ue_policy_map …`로 실패하고 `mv`는 실행되지 않는다(예시에서 만든 policies.conf 유지). 그때는 policies.conf를 직접 쓴다(형식: 파일 안 주석, README §6.1).
+- 기대: export 첫 두 줄이 `# Vantage-5G policies (vantage-5G export): …` 주석이고 이어서 UE별 `<ip> <rx> <tx>` 줄이 주소 순으로 나온다(4.1의 정책과 같음). env에 `IFACE=<IF>`가 있다. `XDP_MODE=`는 비우지 않는다(비우면 preflight status=1, 줄을 지우면 generic). `IFACE_WAIT_SEC`는 최대 240(초과 값은 240으로 줄고 경고). 예시의 `MONITOR_ARGS=--bind 127.0.0.1`을 유지한다. `/metrics`에는 모든 UE의 IP·정책·카운터가 나오므로 원격 Prometheus가 필요하면 관리망 주소로만 `--bind`하고 방화벽으로 제한한다(`--bind`가 없으면 N6 쪽을 포함한 `0.0.0.0:9090`).
+- 실패 시: export가 stderr로 `[!] <ip>: … is not a whole Mbps; exported rounded down`을 내면 그 UE의 값을 기록한다(set/apply 외의 도구가 맵에 쓴 것).
+
+#### 3.6.3 start
+- 명령:
+  ```bash
+  sudo systemctl start vantage-5g vantage-5g-monitor; echo rc=$?
+  systemctl status vantage-5g --no-pager | tee ~/vt-l4/3.6.3-status.txt
+  journalctl -u vantage-5g -b --no-pager | tail -30 | tee ~/vt-l4/3.6.3-journal.txt
+  sudo vantage-5G list; ip -d link show dev <IF> | grep -o 'prog/xdp[a-z]* id [0-9]*'; tc qdisc show dev <IF>
+  ss -ltnp | grep 9090; curl -s http://127.0.0.1:9090/metrics | grep -c '^vantage_'
+  ```
+- 기대: rc=0, `Active: active (exited)`. journal 순서: `[i] BPF objects from /usr/local/lib/vantage-5g` → `[+] applied /etc/vantage-5g/policies.conf (--replace): added …` → `[+] Vantage-5G attached to <IF>.` → `Finished`. `list`가 policies.conf와 같고, XDP·qdisc는 3.3과 같다. 9090 LISTEN(MONITOR_ARGS의 주소), 메트릭 줄 수 > 0.
+- 실패 시: 서비스는 실패해도 **자동 정리하지 않는다**. `systemctl status`의 `ExecStartPre=…`/`ExecStart=… (code=exited, status=N)` 줄로 단계를 판정한다:
+  - `vantage-5g-unit.sh preflight` status=1: env 오류(`IFACE is not set`, `not a valid interface name`, `XDP_MODE is empty`, `XDP_MODE … must be generic or native`) 또는 `policies.conf not found`. status=6: `interface <IF> did not appear within 90s`. `ip link`로 이름을 확인한다.
+  - `vantage-5G load` status=1: 3.2의 실패 시와 같다(`pinned maps … do not match`이면 2장).
+  - `vantage-5G apply` status=1: journal에 `line N: …` 오류 목록과 `nothing was changed`(또는 30초 잠금 대기 초과 `still holds /run/vantage-5g.lock`). 이때 아무것도 attach되지 않는다. 파일을 고치고 다시 start한다.
+  - `setup.sh` status=2/3/4/5: 3.3의 실패 시와 같다. status=3이면 다른 도구의 상태는 그대로이므로 원인을 정리하고 다시 start한다. status=5이면 먼저 `sudo /usr/local/lib/vantage-5g/detach.sh <IF>`를 실행한다.
+  - 원인을 고친 뒤 `sudo systemctl start vantage-5g vantage-5g-monitor`. 출력 전체(status, journal)를 기록한다.
+
+#### 3.6.4 reload (정책 파일 변경)
+- 명령: policies.conf에서 UE 하나의 값을 바꾼 뒤
+  ```bash
+  ip -d link show dev <IF> | grep -o 'prog/xdp[a-z]* id [0-9]*'
+  sudo systemctl reload vantage-5g; echo rc=$?
+  journalctl -u vantage-5g --no-pager -n 6 | tee ~/vt-l4/3.6.4-reload.txt
+  sudo vantage-5G list; ip -d link show dev <IF> | grep -o 'prog/xdp[a-z]* id [0-9]*'
+  ```
+- 기대: rc=0, `[+] applied /etc/vantage-5g/policies.conf (--replace): added 0, changed 1, unchanged <나머지>, removed 0`과 바뀐 UE의 `~` 줄. 앞뒤 XDP prog id가 같다(재attach 없음). 바뀌지 않은 UE는 RX/TX 상태가 유지된다.
+- 정책이 하나도 없는(빈·잘린) 파일로 reload하면 rc≠0, journal에 `has no policies; --replace would remove all N current policies (pass --allow-empty …)`, 정책은 그대로이고 유닛은 active다(선택 확인: `sudo cp /etc/vantage-5g/policies.conf /tmp/pol.keep; sudo truncate -s0 /etc/vantage-5g/policies.conf; sudo systemctl reload vantage-5g; echo rc=$?; sudo vantage-5G list; sudo cp /tmp/pol.keep /etc/vantage-5g/policies.conf`). 정말 모두 지우려면 `sudo vantage-5G apply -f /etc/vantage-5g/policies.conf --replace --allow-empty`.
+- 실패 시: 파일 오류면 rc≠0이고 journal에 줄 번호 목록이 나오며 정책은 그대로다(동작 중인 셰이핑 영향 없음). 파일을 고치고 다시 reload한다. CLI로만 `set`한 UE가 `removed`로 나오면 정상 동작이다(파일이 기준) — 남겨야 했다면 3.6.2의 export로 다시 저장한다.
+
+#### 3.6.5 재부팅 확인
+- 명령:
+  ```bash
+  sudo systemctl reboot
+  # 재접속 후
+  systemctl is-active vantage-5g vantage-5g-monitor
+  journalctl -b -u vantage-5g --no-pager | tee ~/vt-l4/3.6.5-boot-journal.txt
+  systemd-analyze critical-chain vantage-5g.service --no-pager | head -12 | tee ~/vt-l4/3.6.5-chain.txt
+  sudo vantage-5G export > /tmp/exp.txt
+  diff <(grep -vE '^\s*(#|$)' /etc/vantage-5g/policies.conf | awk '{print $1,$2,$3}' | sort) \
+       <(grep -v '^#' /tmp/exp.txt | awk '{print $1,$2,$3}' | sort) && echo policies-match
+  ip -d link show dev <IF> | grep -o 'prog/xdp[a-z]* id [0-9]*'; tc qdisc show dev <IF>; tc filter show dev <IF> egress | head -2
+  ss -ltnp | grep 9090
+  ```
+- 기대: `active` 두 줄. journal은 3.6.3과 같은 순서(load → applied … added N → attached to `<IF>`). `policies-match`. XDP·root qdisc·egress 필터가 3.3과 같다. 9090이 MONITOR_ARGS 주소에서 LISTEN. 이후 4장 측정을 이 상태에서 다시 해도 된다(4.1의 `set` 대신 policies.conf + 3.6.4 reload).
+- 실패 시: preflight status=6(`did not appear within …s`)이면 NIC가 늦게 올라온 것이다. `journalctl -b | grep -iE '<IF>|link'`로 NIC가 나타난 시각을 기록하고 env의 `IFACE_WAIT_SEC`를 늘린다. 장치가 생길 때까지 시작을 미루려면 `sudo systemctl edit vantage-5g`로 `[Unit]`에 `BindsTo=sys-subsystem-net-devices-<IF>.device`와 `After=sys-subsystem-net-devices-<IF>.device`를 넣는 방법도 있다(로컬 미검증, 기록). 정책이 다르면 3.6.2의 파일 내용과 export를 함께 보고한다. 서비스가 `inactive`이고 `is-enabled`가 `disabled`이면 `sudo systemctl enable vantage-5g vantage-5g-monitor`.
+
+#### 3.6.6 stop / start / restart
+- 명령:
+  ```bash
+  sudo systemctl stop vantage-5g; echo rc=$?
+  systemctl is-failed vantage-5g; systemctl is-active vantage-5g-monitor
+  ls /sys/fs/bpf/vantage 2>&1 | head -1; ip -d link show dev <IF> | grep -c prog/xdp; tc qdisc show dev <IF>
+  curl -s http://127.0.0.1:9090/metrics | grep -c '^vantage_ue_policy_'
+  sudo systemctl start vantage-5g; systemctl is-active vantage-5g vantage-5g-monitor
+  systemctl show -p MainPID --value vantage-5g-monitor
+  sudo systemctl restart vantage-5g; systemctl is-active vantage-5g vantage-5g-monitor
+  systemctl show -p MainPID --value vantage-5g-monitor; sleep 2; curl -s http://127.0.0.1:9090/metrics | grep -c '^vantage_ue_policy_'
+  ```
+- 기대: stop rc=0. `is-failed`가 `inactive`(failed 아님), monitor는 `active`로 남는다(Wants=, 핀이 없는 동안 journal에 scrape 오류 1회, `/metrics`의 UE 시리즈 없음). `/sys/fs/bpf/vantage` 없음(`No such file or directory`), `prog/xdp` 0줄, root qdisc는 5.2와 같은 커널 기본값. start 후 두 유닛 모두 `active`(monitor는 처음부터 계속 실행 중). restart 후 둘 다 `active`이고 monitor PID는 **그대로**이며 `/metrics`에 UE 시리즈가 다시 나온다(새 맵을 다시 읽음). restart = detach → unload → load → apply → setup(짧은 셰이핑 공백). monitor까지 멈추려면 `sudo systemctl stop vantage-5g-monitor vantage-5g`.
+- 실패 시: **stop은 정리에 실패해도 rc=0을 돌려준다.** `is-failed`가 `failed`이면 `journalctl -u vantage-5g -n 20`에서 `Vantage programs are still attached:` 아래 목록을 확인하고, 각 인터페이스에 `sudo /usr/local/lib/vantage-5g/detach.sh <iface>` → `sudo vantage-5G unload` → `sudo systemctl reset-failed vantage-5g`. 그 전까지 핀은 유지되고 CLI로 정책을 계속 바꿀 수 있다.
+
 ## 4. README §8 측정 (4세션 동시)
 
 ### 4.0 [UE 호스트] UE IP 확인과 5G 경로 바인딩 확인 (README §8.1)
@@ -235,6 +338,7 @@ DL 응답이 Vantage가 붙은 `<IF>`로 나가야 TX 페이서와 killswitch가
   sudo ./target/release/vantage-5G list
   ```
   (업그레이드였다면 2.1의 정책도 모두 다시 set한다.)
+  서비스(3.6)로 운영 중이면 `set` 대신 policies.conf에 두 줄을 쓰고 `sudo systemctl reload vantage-5g`(3.6.4)로 적용해도 된다. `set`으로 바꾼 정책은 reload·restart·재부팅 때 사라지므로, 측정 후에도 남길 정책은 3.6.2처럼 `export`로 저장한다.
 - 기대: `[+] policy set: UE <UE_A> rx=10 Mbps tx=20 Mbps` 등이 출력되고, `list`에 두 UE가 나온다.
 - 실패 시: `open pinned ue_policy_map (run `vantage-5G load` first; needs root)`이면 3.2(load)와 `sudo`를 확인한다. `invalid value … for '--ue-ip <UE_IP>'`(rc=2)이면 4.0의 주소를 접두사 길이 없이(`10.45.0.2/24`가 아니라 `10.45.0.2`) 넣었는지 확인한다.
 - D26 확인: 같은 명령을 한 번 더 실행한다(`set --ue-ip <UE_A> --rx-mbps 10 --tx-mbps 20`). 출력 끝에 `(unchanged; rx/tx state kept)`가 붙어야 한다 — 같은 값 재적용은 정책만 덮어쓰고 RX 토큰버킷·TX EDT 상태를 유지한다(주기적 재적용에도 버스트/백로그 망각 없음). 값이 바뀌면 이 문구가 없고 상태가 초기화된다. 상태를 강제로 초기화하려면 `reset` 후 `set`한다. 운영 스크립트가 주기적으로 `set`을 재적용한다면 그 동작이 이 의미를 전제로 하는지 확인한다.
@@ -301,6 +405,16 @@ DL 응답이 Vantage가 붙은 `<IF>`로 나가야 TX 페이서와 killswitch가
 - 기대: detach rc=0, `prog/xdp` 0줄(generic·native 슬롯 모두), egress 필터 없음, clsact 없음. root는 커널 기본 qdisc다: 1.8의 TX 큐 N≥2이면 **`mq 0:`**(handle 0, setup.sh의 `mq 1:`이 아님)에 자식이 1.8의 `net.core.default_qdisc` 종류(Ubuntu 기본 `fq_codel`), N=1이면 그 default qdisc 하나. 이전에 직접 넣은 custom qdisc는 복원되지 않는다. unload rc=0, `/sys/fs/bpf`에 `vantage` 없음.
 - 실패 시: detach rc=4이면 남은 목록을 보고한다(native 드라이버에서 xdp 잔존은 X2, `setup.sh's root qdisc (mq 1:, per-queue fq) still present`는 root 삭제 실패). root가 `mq 0:`이 아니거나 자식이 default qdisc와 다르면 `tc qdisc show dev <IF>` 출력을 보고한다(X18).
 
+### 5.3 서비스(3.6)를 설치했다면: uninstall
+- 명령:
+  ```bash
+  sudo ./install.sh uninstall 2>&1 | tee ~/vt-l4/5.3-uninstall.txt; echo rc=${PIPESTATUS[0]}
+  systemctl list-unit-files | grep -E '^vantage-5g'; ls /usr/local/lib/vantage-5g /usr/local/bin/vantage-5G /sys/fs/bpf/vantage 2>&1; ls /etc/vantage-5g
+  sudo ./install.sh uninstall --purge; echo rc=$?; ls /etc/vantage-5g 2>&1
+  ```
+- 기대: rc=0, `[+] Vantage-5G uninstalled.`, 유닛 파일 없음, lib·심볼릭 링크·핀 없음(`No such file or directory`), `/etc/vantage-5g`는 남아 있다(`removed /usr/local/lib/vantage-5g; kept /etc/vantage-5g`). 설정까지 지우려면 `--purge` → rc=0, `/etc/vantage-5g` 없음. 서버에 계속 둘 것이면 이 단계는 하지 않는다.
+- 실패 시: rc=4와 `did not stop cleanly`이면 아무것도 지워지지 않았다. 출력된 대로 `sudo /usr/local/lib/vantage-5g/detach.sh <iface>` 후 다시 `uninstall`한다. rc=5이면 파일은 지워졌지만 핀이 남았고 지울 바이너리가 없다(앞서 `--force`를 쓴 경우): 저장소 빌드로 `sudo ./detach.sh <IF>; sudo ./target/release/vantage-5G unload`.
+
 ## 6. 로컬에서 재현하지 못한 항목 체크리스트 (L4에서만 확인 가능)
 
 | # | 항목 | 확인 위치 |
@@ -319,7 +433,9 @@ DL 응답이 Vantage가 붙은 `<IF>`로 나가야 TX 페이서와 killswitch가
 | X15 | BIG TCP 비활성(gro_max_size ≤ 65536), native XDP에서 rx_packets 의미 | 1.8, 4.3 |
 | X16 | 다른 netns(컨테이너 등)에 attach된 경우 unload 가드 미검출 | 해당 시 |
 | X13 | LRU 조기 퇴출 — 조건은 UE 수가 아니라 CPU 수(nproc > 128 & 커널 < 6.16, 1.1a). stats에서 활성 UE 카운터가 0으로 돌아가는지 | 1.1a, 장기 운영 관찰 |
+| X22 | systemd 서비스: 실제 NIC(드라이버 로드 시간, bond/VLAN, netplan)에서 부팅 시 `network-online.target` 이후 `IFACE`가 제때 있는지(preflight 대기 시간), 재부팅 후 attach·정책 복원. 로컬은 systemd-networkd veth로만 확인 | 3.6.5 |
+| X23 | systemd 서비스와 native XDP(`XDP_MODE=native`)의 부팅·restart 시 링크 리셋 | 3.6.5, 3.6.6 |
 | V20 | 맵 메모리(LRU 3개 memlock 합계 ≈ 4.5 MiB, 커널별 표시 차이) | 3.2 |
 
 ## 7. 가져올 것
-`~/vt-l4/` 전체(서비스 노드와 UE 호스트 양쪽, UPF 호스트의 1.4 출력 포함. 단계별 출력, `nproc`, 3.2의 `bpftool map show` 출력), `*.json` 4~5개, `spec.csv`, `stats_t1.txt`, `stats_t2.txt`, `ethtool -i`/`-l` 출력, 커밋 해시, `uname -r`.
+`~/vt-l4/` 전체(서비스 노드와 UE 호스트 양쪽, UPF 호스트의 1.4 출력 포함. 단계별 출력, `nproc`, 3.2의 `bpftool map show` 출력), `*.json` 4~5개, `spec.csv`, 3.6을 했다면 `3.6.*`·`2.4`·`5.3` 출력과 `journalctl -b -u vantage-5g --no-pager` 전체, `stats_t1.txt`, `stats_t2.txt`, `ethtool -i`/`-l` 출력, 커밋 해시, `uname -r`.

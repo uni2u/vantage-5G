@@ -1,0 +1,67 @@
+# vantage-5g.service -- load, apply policies, attach (installed by install.sh)
+#
+# Start (in order; the first failing step fails the unit, its exit code is the
+# unit's status, later steps do not run):
+#   pre    vantage-5g-unit.sh preflight  mount bpffs if missing, check
+#          /etc/vantage-5g/vantage-5g.env, wait up to IFACE_WAIT_SEC for IFACE
+#          (exit 1 config error, 6 interface did not appear)
+#   1      vantage-5G load               load + pin (idempotent)
+#   2      vantage-5G apply --replace    /etc/vantage-5g/policies.conf, BEFORE the
+#          attach so the first packet already sees every policy (incl. killswitch);
+#          an invalid file fails here with nothing attached
+#   3      setup.sh IFACE --xdp-mode M   exit codes as documented in setup.sh
+#          (2 not loaded/bpftool, 3 refused, 4 verify, 5 partial attach)
+#   post   vantage-5g-unit.sh record     remember IFACE for the stop
+# A failed start is NOT cleaned up automatically: detach.sh removes every
+# egress filter and the root qdisc, which would also remove another tool's
+# state that made setup.sh refuse (exit 3). Follow the setup.sh message in
+# `journalctl -u vantage-5g`.
+#
+# Stop: detach.sh on the interface recorded at start (exit code ignored), then
+# `vantage-5G unload`. unload refuses while any Vantage program is still
+# attached in this netns, so a detach that left something behind (detach.sh
+# exit 4) makes the stop fail and keeps the pins -- the attached programs stay
+# controllable with the CLI instead of running on orphaned maps.
+#
+# Reload (systemctl reload vantage-5g): re-apply policies.conf --replace; no
+# detach, per-UE state of unchanged UEs kept. Policies set with `vantage-5G set`
+# but not in the file are removed on reload, restart and boot -- persist them
+# with `vantage-5G export`.
+[Unit]
+Description=Vantage-5G per-UE bandwidth control (XDP RX policer + tc EDT TX pacer)
+Wants=network-online.target
+After=network-online.target sys-fs-bpf.mount
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Defaults; the env file overrides them.
+Environment=XDP_MODE=generic IFACE_WAIT_SEC=90
+EnvironmentFile=/etc/vantage-5g/vantage-5g.env
+RuntimeDirectory=vantage-5g
+ExecStartPre=/usr/local/lib/vantage-5g/vantage-5g-unit.sh preflight
+ExecStart=/usr/local/lib/vantage-5g/vantage-5G load --obj-dir /usr/local/lib/vantage-5g
+ExecStart=/usr/local/lib/vantage-5g/vantage-5G apply -f /etc/vantage-5g/policies.conf --replace
+ExecStart=/usr/local/lib/vantage-5g/setup.sh ${IFACE} --xdp-mode ${XDP_MODE}
+ExecStartPost=/usr/local/lib/vantage-5g/vantage-5g-unit.sh record
+ExecReload=/usr/local/lib/vantage-5g/vantage-5G apply -f /etc/vantage-5g/policies.conf --replace
+ExecStop=-/usr/local/lib/vantage-5g/vantage-5g-unit.sh detach
+ExecStop=/usr/local/lib/vantage-5g/vantage-5G unload
+# TimeoutStartSec includes the IFACE wait (IFACE_WAIT_SEC, clamped to
+# IFACE_WAIT_MAX=240 by the preflight). Raise both together in a drop-in.
+TimeoutStartSec=300
+TimeoutStopSec=120
+
+# Hardening without a private mount namespace: the preflight's `mount -t bpf`
+# fallback and every pin must land in the host's /sys/fs/bpf, so no
+# PrivateTmp/ProtectSystem/ProtectHome/ProtectKernelTunables/ReadOnlyPaths.
+# Capabilities: SYS_ADMIN (bpffs mount, bpftool, BPF on older kernels),
+# NET_ADMIN (ip link xdp, tc, net.core.default_qdisc), BPF+PERFMON (5.8+ BPF
+# load), DAC_OVERRIDE (bpffs 0700 / root-only files), SYS_RESOURCE (libbpf
+# RLIMIT_MEMLOCK bump on kernels without memcg BPF accounting).
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_BPF CAP_PERFMON CAP_DAC_OVERRIDE CAP_SYS_RESOURCE
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

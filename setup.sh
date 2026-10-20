@@ -118,6 +118,13 @@ esac
 SUDO=""
 [[ "$(id -u)" -eq 0 ]] || SUDO="sudo"
 
+# Paths for operator hints: where this script and the CLI actually are
+# (repository checkout, or /usr/local/lib/vantage-5g when installed).
+SELF_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+if [[ -x "${SELF_DIR}/vantage-5G" ]]; then CLI="${SELF_DIR}/vantage-5G"
+elif [[ -x "${SELF_DIR}/target/release/vantage-5G" ]]; then CLI="${SELF_DIR}/target/release/vantage-5G"
+else CLI="vantage-5G"; fi
+
 PIN_DIR="/sys/fs/bpf/vantage"
 PROG_XDP="${PIN_DIR}/vantage_rx_policer"
 PROG_TC="${PIN_DIR}/vantage_tx_pacer"
@@ -134,7 +141,7 @@ MQ_HANDLE=1
 
 if ! ${SUDO} test -e "${PROG_XDP}" || ! ${SUDO} test -e "${PROG_TC}"; then
     echo "[-] pinned programs not found under ${PIN_DIR}"
-    echo "    run 'sudo ./target/release/vantage-5G load' first."
+    echo "    run 'sudo ${CLI} load' first."
     exit 2
 fi
 
@@ -314,7 +321,7 @@ case "${MODE}" in
         ;;
     *)
         echo "[-] ${IFACE} has XDP attached in '${MODE}' mode (id ${AID:-?}); setup.sh only manages generic/native."
-        echo "    Run 'sudo ./detach.sh ${IFACE}' (or detach that program) and re-run."
+        echo "    Run 'sudo ${SELF_DIR}/detach.sh ${IFACE}' (or detach that program) and re-run."
         exit 3
         ;;
 esac
@@ -382,7 +389,7 @@ partial_fail() {
     [[ "${BASH_SUBSHELL}" -eq 0 ]] || exit 5
     echo
     echo "[-] step failed (status $1, setup.sh line $2) after ${IFACE} was already changed."
-    echo "    ${IFACE} may be partially attached. Run 'sudo ./detach.sh ${IFACE}',"
+    echo "    ${IFACE} may be partially attached. Run 'sudo ${SELF_DIR}/detach.sh ${IFACE}',"
     echo "    fix the cause above, and re-run setup.sh."
     exit 5
 }
@@ -545,7 +552,7 @@ echo "    - TX pacer  (tc egress pref ${TC_PREF}): ${PROG_TC}"
 echo "    - TX qdisc  ${QDESC}"
 echo
 echo "Next:"
-echo "    sudo ./target/release/vantage-5G set --ue-ip 10.45.1.23 --rx-mbps 10 --tx-mbps 20"
-echo "    sudo ./target/release/vantage-5G monitor"
+echo "    sudo ${CLI} set --ue-ip 10.45.1.23 --rx-mbps 10 --tx-mbps 20"
+echo "    sudo ${CLI} monitor"
 echo
-echo "To detach:  sudo ./detach.sh ${IFACE}"
+echo "To detach:  sudo ${SELF_DIR}/detach.sh ${IFACE}"

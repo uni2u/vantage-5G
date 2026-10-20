@@ -16,6 +16,7 @@ Metrics are exported to Prometheus for a dashboard.
    - [3.2 Network prerequisites (5G core side)](#32-network-prerequisites-5g-core-side)
 4. [Build](#4-build)
 5. [Bootstrap — one-time load and attach](#5-bootstrap--one-time-load-and-attach)
+   - [5a. Run as systemd services (`install.sh`)](#5a-run-as-systemd-services-installsh)
 6. [Set / reset / inspect per-UE policy](#6-set--reset--inspect-per-ue-policy)
 7. [Monitor — Prometheus exporter](#7-monitor--prometheus-exporter)
 8. [Verification — Phase 1 completion criteria](#8-verification--phase-1-completion-criteria)
@@ -26,7 +27,7 @@ Metrics are exported to Prometheus for a dashboard.
 13. [Local development & testing](#13-local-development--testing)
 14. [Roadmap](#14-roadmap)
 
-Quick path on a fresh service node: §3.2 (network) → §3.1 (packages) → §4 (`make build`) → §5 (`load`, `setup.sh`) → §6 (`set`) → §8 (measure). A step-by-step install runbook with expected output and failure actions for every step (Korean) is in [`docs/install-runbook.md`](docs/install-runbook.md).
+Quick path on a fresh service node: §3.2 (network) → §3.1 (packages) → §4 (`make build`) → §5 (`load`, `setup.sh`) → §6 (`set`) → §8 (measure). To have it come up at every boot instead, install the systemd services after `make build` (§5a). A step-by-step install runbook with expected output and failure actions for every step (Korean) is in [`docs/install-runbook.md`](docs/install-runbook.md).
 
 ## 1. What this is
 
@@ -64,7 +65,7 @@ Phase 2 (later) will extend the policy key to a 5-tuple LPM_TRIE for micro-segme
 | OS | Ubuntu 22.04 / 24.04 |
 | Kernel | Linux 5.15+ (BTF at `/sys/kernel/btf/vmlinux`) |
 | Tools | `clang`, `llvm`, `bpftool` (from `linux-tools-$(uname -r)`), `iproute2` (`tc`, `ip`), `libbpf-dev`, `libelf-dev`, `zlib1g-dev` |
-| Toolchain | Rust stable (`rustup`) |
+| Toolchain | Rust stable (`rustup`), 1.89 or newer (the CLI uses `std::fs::File::try_lock`) |
 | NIC | Any NIC: `setup.sh` attaches XDP in generic mode (`xdpgeneric`) by default. `--xdp-mode native` (`xdpdrv`) needs driver XDP support (§5). Single- or multi-queue. |
 | Privilege | Every `vantage-5G` subcommand (`load`, `unload`, `set`, `reset`, `list`, `stats`, `monitor`) needs root: the pins under `/sys/fs/bpf` are root-only. `setup.sh` / `detach.sh` run as root or as a user with `sudo` rights (they call `sudo` themselves). `make build` runs as a normal user. |
 
@@ -261,7 +262,7 @@ sudo ./setup.sh enp1s0 --xdp-mode native
 - `native` attaches with `xdpdrv` and needs driver XDP support (e.g. veth, virtio_net, ixgbe, i40e, ice, mlx5). If the driver refuses, `setup.sh` prints the kernel's message and the driver name, suggests `--xdp-mode generic` and exits 3 without changing anything.
 - If a Vantage program is already attached in the other mode, `setup.sh` detaches it and attaches in the requested mode. The kernel does not allow generic and native at the same time, so RX policing pauses for that moment. If the new attach fails, the previous mode is restored with the **pinned** program and `setup.sh` exits 3 (exit 4 if even the restore fails: the NIC then has no RX policer). If the program attached before was one from an earlier `load`, its prog id changes with that restore. On several physical drivers a native attach/detach reconfigures the rings, which resets the link briefly.
 
-`load` is needed once per boot (pins under `/sys/fs/bpf` do not survive a reboot), and so is `setup.sh`. Policies are stored in the pinned map, so they are lost on reboot as well; re-run `set` for every UE afterwards.
+`load` is needed once per boot (pins under `/sys/fs/bpf` do not survive a reboot), and so is `setup.sh`. Policies are stored in the pinned map, so they are lost on reboot as well; re-run `set` for every UE afterwards, or keep them in a policy file (`apply`/`export`, §6). The systemd services in §5a do all of this at boot.
 
 What `setup.sh` does:
 
@@ -297,6 +298,78 @@ Successful output ends with:
 
 (On a multi-queue NIC the last line reads e.g. `TX qdisc  root mq 1: + fq on all 8 mq classes (4 TX queues in use)`.)
 
+## 5a. Run as systemd services (`install.sh`)
+
+Instead of running §5 and §6 by hand after every boot, `install.sh` installs two systemd units that load, apply a policy file and attach at boot. Build first as a normal user (`make build`, §4); `install.sh` copies the build artifacts and needs systemd.
+
+```bash
+make build
+sudo ./install.sh install --enable          # --enable: start both units at boot (does not start them now)
+sudoedit /etc/vantage-5g/vantage-5g.env      # IFACE=<N6 interface> (required)
+sudoedit /etc/vantage-5g/policies.conf       # one "<UE_IPv4> <rx_mbps> <tx_mbps>" per line
+sudo systemctl start vantage-5g vantage-5g-monitor
+systemctl status vantage-5g
+```
+
+What `sudo ./install.sh install [--enable]` puts where:
+
+| Path | Content |
+|---|---|
+| `/usr/local/lib/vantage-5g/` | `vantage-5G`, `vantage_rx_policer.o`, `vantage_tx_pacer.o`, `setup.sh`, `detach.sh`, `vantage-5g-unit.sh` (unit helper, not for manual use) |
+| `/usr/local/bin/vantage-5G` | symlink to the binary above (left alone, with a warning, if a regular file is already there) |
+| `/etc/systemd/system/` | `vantage-5g.service`, `vantage-5g-monitor.service` (overwritten on every install; customise with `systemctl edit`) |
+| `/etc/vantage-5g/` | `vantage-5g.env`, `policies.conf`: created from the examples only if missing, never overwritten. The `*.example` copies next to them are refreshed on every install |
+
+Re-running `install` is the upgrade path and is safe while the service runs: files are replaced one by one by rename (`.o` files and scripts first, the binary last; temporary files are removed on failure or interrupt), and a running `vantage-5g.service` is **not** restarted. The set is not replaced atomically: after an interrupted install, re-run it before restarting the service. The new binary and `.o` files take effect on `sudo systemctl restart vantage-5g` (the install output says so). At the end `install` warns if `IFACE=` is empty and if `MONITOR_ARGS` has no `--bind` (the exporter would then listen on `0.0.0.0:9090`). Exit codes: `0` ok, `1` usage or not root or no `systemctl`, `2` build artifacts missing (`missing in <repo>: …`, run `make build`), `4` and `5` uninstall (below).
+
+`/etc/vantage-5g/vantage-5g.env` (systemd `KEY=VALUE` syntax, read by both units):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `IFACE` | empty | N6-facing interface passed to `setup.sh` (required; the unit fails with exit 1 while it is empty or not a valid interface name) |
+| `XDP_MODE` | `generic` | `generic` or `native` (`setup.sh --xdp-mode`, §5). Do not leave it empty: `XDP_MODE=` fails the preflight with exit 1 (`XDP_MODE is empty …`); delete the line to get the default `generic` |
+| `IFACE_WAIT_SEC` | `90` | seconds the start waits for `IFACE` to appear (late NICs, bonds, VLANs); exit 6 after that. At most 240: a larger value is reduced to 240 with a warning (`exceeds 240s … waiting 240s`), because the whole start must fit in the unit's `TimeoutStartSec=300`. To wait longer, `sudo systemctl edit vantage-5g` and raise `TimeoutStartSec=` together with `Environment=IFACE_WAIT_MAX=` (about 60 s less) |
+| `MONITOR_ARGS` | `--bind 127.0.0.1` in the example file | arguments for `vantage-5G monitor` (§7). `/metrics` lists every UE's IP, policy and counters: for a remote Prometheus `--bind` a management-network address only and firewall it. Without `--bind` (empty value or line missing) the exporter listens on `0.0.0.0:9090`, N6 side included, and `install.sh` warns |
+
+`/etc/vantage-5g/policies.conf` is in the `apply` format (§6.1, §12.10). It must exist. It may be empty or comments only: at boot the maps are new and empty, so that just means "no policies". On a running service, though, a file without policies does **not** clear the existing ones: `apply --replace` refuses it without `--allow-empty`, so a reload with an empty or truncated file fails and the current policies stay. To really clear all policies: `sudo vantage-5G apply -f /etc/vantage-5g/policies.conf --replace --allow-empty`.
+
+**`vantage-5g.service`** (`Type=oneshot`, `RemainAfterExit=yes`, ordered after `network-online.target`). Each step is a separate command; the first one that fails fails the unit and the later ones do not run:
+
+| Step | Command | Fails with |
+|---|---|---|
+| pre | preflight: mount `/sys/fs/bpf` if it is not mounted, check the env file, wait up to `IFACE_WAIT_SEC` for `IFACE`, check that `policies.conf` exists | `1` config error, `6` interface did not appear |
+| 1 | `vantage-5G load --obj-dir /usr/local/lib/vantage-5g` | `1` (§12.3) |
+| 2 | `vantage-5G apply -f /etc/vantage-5g/policies.conf --replace` — **before** the attach, so the first packet already sees every policy, killswitch included | `1` invalid file: nothing is attached |
+| 3 | `setup.sh $IFACE --xdp-mode $XDP_MODE` | `2`/`3`/`4`/`5` (§12.9) |
+| post | remember `IFACE` in `/run/vantage-5g/iface` for the stop | — |
+
+**`vantage-5g-monitor.service`** runs `vantage-5G monitor $MONITOR_ARGS` (`Restart=on-failure`, at most 10 restarts in 5 minutes; after that it stays failed until `sudo systemctl reset-failed vantage-5g-monitor` and a start). It `Wants=` and comes `After=` `vantage-5g.service`: starting the monitor starts the main unit too, but the monitor keeps running when the main unit fails, is stopped or is restarted. While the pins are gone it logs the scrape error once and drops the series; after the next start it reads the new maps without being restarted itself.
+
+Both units run with `NoNewPrivileges=yes`, a `CapabilityBoundingSet` (main: `CAP_SYS_ADMIN CAP_NET_ADMIN CAP_BPF CAP_PERFMON CAP_DAC_OVERRIDE CAP_SYS_RESOURCE`; monitor: `CAP_BPF CAP_DAC_OVERRIDE`) and `RestrictAddressFamilies`, and without a private mount namespace (pins and the preflight's bpffs mount must be in the host's `/sys/fs/bpf`).
+
+Operations:
+
+| Command | Effect |
+|---|---|
+| `sudo systemctl start vantage-5g vantage-5g-monitor` | the steps above, then the exporter |
+| `sudo systemctl reload vantage-5g` | re-apply `policies.conf` with `--replace`; no detach, unchanged UEs keep their RX/TX state (§6), UEs not in the file lose their policy. A file with an error, or without any policy while policies exist, fails the reload and changes nothing. Output in `journalctl -u vantage-5g` |
+| `sudo systemctl restart vantage-5g` | stop + start = `detach.sh` → `unload` → `load` → `apply` → `setup.sh`: the upgrade procedure of §10, with a short shaping gap. Use it after `install` (new version) or after editing `vantage-5g.env` |
+| `sudo systemctl stop vantage-5g` | `detach.sh` on the interface recorded at start (also when `IFACE` was edited since), then `vantage-5G unload`. The monitor keeps running (stop it with `sudo systemctl stop vantage-5g-monitor`) |
+| `sudo systemctl enable vantage-5g vantage-5g-monitor` | start at boot (same as `install --enable`) |
+
+- **The policy file is the source of truth.** A policy made with `vantage-5G set` that is not in `policies.conf` is removed by the next reload, restart or boot. Save the current policies before that: `sudo vantage-5G export > /tmp/policies.conf && sudo mv /tmp/policies.conf /etc/vantage-5g/policies.conf` (write to a temporary file first: redirecting straight into `policies.conf` would leave it empty if `export` fails).
+- **A failed start is not cleaned up.** `systemctl status vantage-5g` shows the failing step and its exit code, e.g. `ExecStart=/usr/local/lib/vantage-5g/setup.sh … (code=exited, status=3)`; `journalctl -u vantage-5g` has the step's own message. Nothing is detached automatically, because `detach.sh` removes every egress filter and the root qdisc, which would also remove the other tool's state that made `setup.sh` refuse (exit 3). Fix the cause as the message says (after exit 5 run `sudo /usr/local/lib/vantage-5g/detach.sh <iface>` first) and start again.
+- **Check a stop with `is-failed`.** `systemctl stop vantage-5g` returns exit code 0 even when its cleanup failed. If a Vantage program is still attached anywhere in the network namespace after the detach (e.g. `detach.sh` exit 4, or a program attached by hand to another interface), `unload` refuses, the pins are kept (the CLI keeps working) and the unit ends up `failed`: `systemctl is-failed vantage-5g` prints `failed`, and `journalctl -u vantage-5g` lists the interfaces still attached. Run `sudo /usr/local/lib/vantage-5g/detach.sh <iface>` for each of them, then `sudo vantage-5G unload` (or start the service again) and `sudo systemctl reset-failed vantage-5g`.
+
+Remove:
+
+```bash
+sudo ./install.sh uninstall            # keeps /etc/vantage-5g
+sudo ./install.sh uninstall --purge    # also removes /etc/vantage-5g
+```
+
+`uninstall` stops both units (= detach + unload), removes leftover pins with `vantage-5G unload` (the installed binary, or the repository's `target/release/vantage-5G` if that is gone), disables and deletes the units, the `/usr/local/bin/vantage-5G` symlink and `/usr/local/lib/vantage-5g`. If the stop or the unload fails (a Vantage program is still attached), it removes **nothing** and exits 4, so the CLI and `detach.sh` stay installed: `sudo /usr/local/lib/vantage-5g/detach.sh <iface>`, then re-run (`--force` removes the files anyway). Exit 5: everything was removed, but pins are left under `/sys/fs/bpf/vantage` and no `vantage-5G` binary was available to remove them (e.g. after an earlier `--force`); clean up with a repository build: `sudo <repo>/detach.sh <iface>; sudo <repo>/target/release/vantage-5G unload`. Re-running `uninstall` is safe.
+
 ## 6. Set / reset / inspect per-UE policy
 
 ```bash
@@ -326,7 +399,32 @@ sudo ./target/release/vantage-5G stats --ue-ip 10.45.1.23
 - Counters (`stats`) are kept after `reset`; they are only counted while the UE has a policy.
 - The UE address must be the one seen on N6 (§3.2). With UERANSIM it is the address of the UE's `uesimtunN` interface (§8.1).
 
-Output of each command: §12.
+### 6.1 Policy files: `apply` and `export`
+
+Many UEs at once, or policies that should survive a reboot, go into a file with one `<UE_IPv4> <rx_mbps> <tx_mbps>` per line (same values as `set`; `#` starts a comment, blank lines are ignored):
+
+```
+# /etc/vantage-5g/policies.conf
+10.45.1.23   10   20
+10.45.1.24    3    0    # DL blocked
+```
+
+```bash
+sudo ./target/release/vantage-5G apply -f policies.conf             # add / change the listed UEs
+sudo ./target/release/vantage-5G apply -f policies.conf --replace   # ... and reset every UE not listed
+sudo ./target/release/vantage-5G export > /tmp/policies.conf        # current policies, same format
+sudo ./target/release/vantage-5G export | sudo ./target/release/vantage-5G apply -f -   # `-` = stdin
+```
+
+- The whole file is checked before anything is changed: one bad line (wrong field count, not an IPv4 address, not a plain integer, out of `0..=400000`, a UE listed twice) and nothing is applied; every problem is listed with its line number (exit 1).
+- Each listed UE gets `set` semantics: same values = policy rewritten, RX/TX state kept (`unchanged`); different values = state cleared. `--replace` additionally resets (as `reset`) every UE that has a policy but is not in the file. A file with no policies at all (empty, comments only, truncated) is refused with `--replace` while policies exist (exit 1, nothing changed), unless `--allow-empty` is also given (then every policy is removed). With an empty map it is accepted.
+- If the result would exceed the policy map's 1024 entries, `apply` refuses before changing anything (exit 1). With `--replace`, removals are done first, so a full map can be swapped for a different set of 1024 UEs.
+- `export` prints the policies sorted by UE address, so `export` → edit → `apply --replace` round-trips.
+- `set`, `reset` and `apply` serialize on `/run/vantage-5g.lock`: if another of them is running, the command prints `[i] waiting for /run/vantage-5g.lock …` and waits up to 30 s, then fails with exit 1 without changing anything. `list`, `export`, `stats` and `monitor` do not take the lock.
+- A UTF-8 byte-order mark at the start of the file and CRLF line ends are accepted.
+- The systemd service (§5a) applies `/etc/vantage-5g/policies.conf` with `--replace` at every start and reload.
+
+Output of each command: §12 (`apply`: §12.10, `export`: §12.11).
 
 ## 7. Monitor — Prometheus exporter
 
@@ -527,7 +625,7 @@ sudo ./detach.sh enp1s0                        # remove tc filter, XDP, clsact, 
 sudo ./target/release/vantage-5G unload         # remove pinned programs & maps
 ```
 
-- Order matters: `unload` refuses (exit 1, pins untouched) while a Vantage program is still attached to any interface in the current network namespace, and prints `run: sudo ./detach.sh <iface>`. It does not see attachments in other network namespaces.
+- Order matters: `unload` refuses (exit 1, pins untouched) while a Vantage program is still attached to any interface in the current network namespace, and prints `run: sudo <dir>/detach.sh <iface>` (`<dir>` = the directory holding `detach.sh` next to the binary or at the repository root, e.g. `/usr/local/lib/vantage-5g` for the service install). It does not see attachments in other network namespaces.
 - `detach.sh` removes every egress filter on the interface (not only Vantage's), XDP in both the generic and the native slot, `clsact` and the root qdisc (`fq`, or `mq 1:` with its per-queue `fq`). The kernel then re-creates its default root: on a multi-queue NIC an `mq` (handle `0:`) with one `net.core.default_qdisc` child per TX queue, on a single-queue NIC the `net.core.default_qdisc`, on veth and other no-queue devices `noqueue`. A custom root qdisc that existed before `setup.sh` is **not** restored. It then checks the interface: exit 0 nothing left, exit 1 no such interface, **exit 4** an XDP program, egress filter, `clsact` or `setup.sh`'s root `mq 1:` is still there (listed; e.g. run without root/sudo). Do not `unload` after exit 4.
 
 ## 10. Troubleshooting
@@ -554,7 +652,7 @@ sudo ./target/release/vantage-5G unload         # remove pinned programs & maps
 
 **Verifier rejects the program after `make build`** — usually a kernel/BTF mismatch. `make check` verifies BTF; if you upgraded the kernel, re-run `make clean && make build` so `vmlinux.h` is regenerated for the running kernel.
 
-**`load` fails with `pinned maps under /sys/fs/bpf/vantage do not match the object`** — the new build changed a map definition (this release: `rx_state_map`, `tx_tstamp_map` and `ue_stats_map` became `LRU_HASH` with 16384 entries; the message lists each difference, e.g. `max_entries 1024 -> 16384`), so the maps pinned by the running version cannot be reused. Nothing was changed; the running version keeps working. Upgrade in this order, then re-apply every policy (they are lost with the old maps):
+**`load` fails with `pinned maps under /sys/fs/bpf/vantage do not match the object`** — the new build changed a map definition (this release: `rx_state_map`, `tx_tstamp_map` and `ue_stats_map` became `LRU_HASH` with 16384 entries; the message lists each difference, e.g. `max_entries 1024 -> 16384`), so the maps pinned by the running version cannot be reused. Nothing was changed; the running version keeps working. With the systemd service (§5a): `sudo ./install.sh install` and then `sudo systemctl restart vantage-5g`, which runs exactly this order and restores the policies from `/etc/vantage-5g/policies.conf` (save CLI-only policies with `export` first). By hand, upgrade in this order, then re-apply every policy (they are lost with the old maps; `apply -f <file>` re-applies a saved `export`):
 
 ```bash
 sudo ./detach.sh <iface>
@@ -578,11 +676,15 @@ sudo ./target/release/vantage-5G set --ue-ip ... --rx-mbps ... --tx-mbps ...   #
 |---|---|
 | `vantage_rx_policer.c` | XDP program: per-UE token-bucket RX policer. |
 | `vantage_tx_pacer.c`   | tc-bpf egress program: per-UE EDT TX pacer + killswitch. |
-| `src/main.rs`          | Rust CLI: `load`, `unload`, `set`, `reset`, `list`, `stats`, `monitor`. |
+| `src/main.rs`          | Rust CLI: `load`, `unload`, `set`, `reset`, `list`, `apply`, `export`, `stats`, `monitor`. |
 | `Cargo.toml`           | Rust deps: `libbpf-rs`, `libbpf-sys`, `prometheus`, `prometheus_exporter`, `lazy_static`, `clap`, `anyhow`. |
 | `Makefile`             | `make check / build / bpf / rust / clean`. |
 | `setup.sh`             | Attach pinned programs to a NIC (`--xdp-mode generic\|native`), set root `fq` or root `mq` + per-queue `fq`. |
 | `detach.sh`            | Undo `setup.sh`. |
+| `install.sh`           | `install [--enable]` / `uninstall [--purge] [--force]`: install or remove the systemd services and their files (§5a). |
+| `systemd/vantage-5g.service`, `systemd/vantage-5g-monitor.service` | Units installed to `/etc/systemd/system/`: preflight → `load` → `apply --replace` → `setup.sh` at start, `apply --replace` on reload, `detach.sh` → `unload` on stop; the Prometheus exporter (§5a). |
+| `systemd/vantage-5g-unit.sh` | Unit helper (`preflight` / `record` / `detach`), installed to `/usr/local/lib/vantage-5g/`; not for manual use. |
+| `systemd/vantage-5g.env.example`, `systemd/policies.conf.example` | Templates for `/etc/vantage-5g/vantage-5g.env` and `/etc/vantage-5g/policies.conf`. |
 | `docs/install-runbook.md` | Step-by-step install and measurement runbook for a physical Ubuntu server (Korean): command / expected result / on failure for each step. |
 | `testbed/`             | Local test harness (Docker and VirtualBox VM); see [`testbed/README.md`](testbed/README.md) and §13. |
 | `.claude/`             | Development-agent configuration (agents and skills). Also holds the result-judging scripts used in §8.5: `.claude/skills/vantage-testbed/scripts/iperf_verdict.py`, `counter_verdict.py`. Not needed to build or run Vantage. |
@@ -615,6 +717,8 @@ Commands:
   set      Set per-UE RX/TX bandwidth limits (in Mbps, 0..=400000). rx_mbps=0 means "RX uncapped", tx_mbps=0 means "block DL"
   reset    Clear the policy for a UE (drop from map; traffic bypasses shaping)
   list     Print every UE currently in the policy map
+  apply    Apply a policy file: one `<UE_IPv4> <rx_mbps> <tx_mbps>` per line, `#` starts a comment. The whole file is validated before anything is changed. Each UE gets `set` semantics (same values = state kept). With --replace, policies of UEs not in the file are reset
+  export   Print the current policies in the `apply` file format (sorted by UE IP)
   stats    Print RX/TX counters for one UE (or all UEs when --ue-ip is omitted)
   monitor  Run the Prometheus exporter (foreground). Scrapes pinned stats maps
   help     Print this message or the help of the given subcommand(s)
@@ -629,7 +733,7 @@ Options:
 | Code | Meaning | Output |
 |---|---|---|
 | `0` | Success (also `--help`, `--version`). | stdout |
-| `1` | Runtime error: pins missing, not root, map full, load refused, unload refused, port in use, … | `Error: <what>` and `Caused by:` lines on stderr |
+| `1` | Runtime error: pins missing, not root, map full, load refused, unload refused, port in use, invalid or unreadable policy file (`apply`), … | `Error: <what>` and `Caused by:` lines on stderr |
 | `2` | Argument error (unknown option or subcommand, missing required option, value out of range, malformed IP address). | `error: …` on stderr, e.g. `error: invalid value '…' for '--…'` or `error: the following required arguments were not provided:`, always followed by `For more information, try '--help'.` |
 
 ### 12.2 Options
@@ -641,12 +745,15 @@ Options:
 | `set` | `--tx-mbps <TX_MBPS>` | integer `0..=400000`; `0` = downlink killswitch | — | yes |
 | `reset` | `--ue-ip <UE_IP>` | IPv4 address | — | yes |
 | `stats` | `--ue-ip <UE_IP>` | IPv4 address | all UEs | no |
+| `apply` | `-f, --file <FILE>` | path of a policy file (§6.1), or `-` for stdin | — | yes |
+| `apply` | `--replace` | flag: also reset every policy not listed in the file | off | no |
+| `apply` | `--allow-empty` | flag, needs `--replace`: accept a file with no policies (removes every policy) | off | no |
 | `load` | `--obj-dir <DIR>` | directory holding both `vantage_rx_policer.o` and `vantage_tx_pacer.o`; only this directory is used (no search) | search: `<exe dir>/../..` → exe dir → current dir (§12.3) | no |
 | `monitor` | `--bind <BIND>` | one IPv4 or IPv6 address (`127.0.0.1`, `::1`, `::`); no hostname, no CIDR, no IPv6 zone id (`fe80::1%eth0` is rejected; use a global/ULA address or `::`) | `0.0.0.0` | no |
 | `monitor` | `--port <PORT>` | integer `1..=65535` | `9090` | no |
 | `monitor` | `--scrape-ms <SCRAPE_MS>` | milliseconds between map reads, `100..=60000` | `1000` | no |
 
-`unload` and `list` take no options. Out-of-range or malformed values exit 2, e.g. `error: invalid value '0' for '--port <PORT>': 0 is not in 1..=65535`, `error: invalid value '50' for '--scrape-ms <SCRAPE_MS>': 50 is not in 100..=60000`, `error: invalid value '10.0.0.0/8' for '--bind <BIND>': invalid IP address syntax`.
+`unload`, `list` and `export` take no options. Out-of-range or malformed values exit 2, e.g. `error: invalid value '0' for '--port <PORT>': 0 is not in 1..=65535`, `error: invalid value '50' for '--scrape-ms <SCRAPE_MS>': 50 is not in 100..=60000`, `error: invalid value '10.0.0.0/8' for '--bind <BIND>': invalid IP address syntax`.
 
 ### 12.3 `load`
 
@@ -674,14 +781,14 @@ $ sudo ./target/release/vantage-5G load
 [+] loaded vantage_rx_policer and pinned to /sys/fs/bpf/vantage/vantage_rx_policer
 [+] loaded vantage_tx_pacer and pinned to /sys/fs/bpf/vantage/vantage_tx_pacer
 [+] Vantage-5G loaded. Pins under /sys/fs/bpf/vantage
-    Attach with: sudo ./setup.sh <iface>
+    Attach with: sudo /home/ops/vantage-5g/setup.sh <iface>
 
 $ sudo ./target/release/vantage-5G load          # second time
 [i] BPF objects from /home/ops/vantage-5g
 [i] vantage_rx_policer already pinned, skipping load.
 [i] vantage_tx_pacer already pinned, skipping load.
 [+] Vantage-5G loaded. Pins under /sys/fs/bpf/vantage
-    Attach with: sudo ./setup.sh <iface>
+    Attach with: sudo /home/ops/vantage-5g/setup.sh <iface>
 ```
 
 Objects not found (exit 1, nothing pinned, `/sys/fs/bpf/vantage` not created):
@@ -696,7 +803,7 @@ $ cd /tmp && sudo /opt/vantage/vantage-5G load    # binary copied without the .o
 Error: BPF object files not found
 ```
 
-Refused upgrade (pins from an older build, exit 1): `[-] vantage_rx_policer.o: pinned maps under /sys/fs/bpf/vantage do not match the object:`, one line per map such as `rx_state_map (pinned -> .o): max_entries 1024 -> 16384`, and the upgrade procedure (§10).
+Refused upgrade (pins from an older build, exit 1): `[-] vantage_rx_policer.o: pinned maps under /sys/fs/bpf/vantage do not match the object:`, one line per map such as `rx_state_map (pinned -> .o): max_entries 1024 -> 16384`, and the upgrade procedure with the actual paths: `with the systemd service: sudo systemctl restart vantage-5g` (policies restored from `/etc/vantage-5g/policies.conf`), or by hand `detach.sh` → `unload` → `load` → `setup.sh` and then `apply -f <file>` or `set` for every UE (§10).
 
 ### 12.4 `unload`
 
@@ -713,7 +820,7 @@ $ sudo ./target/release/vantage-5G unload        # still attached: exit 1, pins 
 [-] Vantage programs are still attached:
       vt-n6: xdpgeneric prog id 18 (vantage_rx_poli)
       vt-n6: tc egress pref 1 handle 1 prog id 20 (vantage_tx_pace)
-    run: sudo ./detach.sh vt-n6
+    run: sudo /home/ops/vantage-5g/detach.sh vt-n6
 Error: refusing to unload while attached (pins left untouched)
 ```
 
@@ -732,7 +839,7 @@ $ sudo ./target/release/vantage-5G set --ue-ip 10.45.1.23 --rx-mbps 400001 --tx-
 error: invalid value '400001' for '--rx-mbps <RX_MBPS>': 400001 is not in 0..=400000
 ```
 
-Errors (exit 1): `open pinned ue_policy_map (run `vantage-5G load` first; needs root)`; `update ue_policy_map for <ip>` / `Argument list too long (os error 7)` when 1024 UEs already have a policy.
+Errors (exit 1): `open pinned ue_policy_map (run `vantage-5G load` first; needs root)`; `update ue_policy_map for <ip>` / `Argument list too long (os error 7)` when 1024 UEs already have a policy; `another vantage-5G set/reset/apply still holds /run/vantage-5g.lock after 30 s; nothing was changed` (`set`, `reset` and `apply` wait up to 30 s for each other, §6.1).
 
 ### 12.6 `reset`
 
@@ -816,6 +923,70 @@ It exits (code 1) only when the HTTP server cannot start: `Error: start Promethe
 
 `detach.sh` removes **all** egress filters and the root qdisc on the interface, not only Vantage's; the kernel then re-creates its default root qdisc (§9).
 
+### 12.10 `apply`
+
+```
+$ ./target/release/vantage-5G apply --help
+Apply a policy file: one `<UE_IPv4> <rx_mbps> <tx_mbps>` per line, `#` starts a comment. The whole file is validated before anything is changed. Each UE gets `set` semantics (same values = state kept). With --replace, policies of UEs not in the file are reset
+
+Usage: vantage-5G apply [OPTIONS] --file <FILE>
+
+Options:
+  -f, --file <FILE>  Policy file (`-` = stdin)
+      --replace      Also reset every policy not listed in the file
+      --allow-empty  With --replace: allow a file with no policies to remove every current policy (refused otherwise, to catch an empty/truncated file)
+  -h, --help         Print help
+```
+
+File format: §6.1. Fields are separated by spaces or tabs; the address must be a plain dotted quad (`10.45.1.23`, no prefix length) and the rates plain decimal integers `0..=400000` (`+5`, `-1`, `1.5` are rejected). The file is parsed completely first, then the map is opened, then the capacity is checked, then (with `--replace`) the UEs not listed are removed, then the listed UEs are written in file order. One line per UE that is added (`+`), changed (`~`) or removed (`-`); unchanged UEs get no line. The last line is the summary.
+
+```
+$ sudo ./target/release/vantage-5G apply -f /tmp/p.conf
+    + 10.45.1.23       rx=10 Mbps tx=20 Mbps  added
+    + 10.45.1.24       rx=3 Mbps tx=0 Mbps (killswitch)  added
+[+] applied /tmp/p.conf: added 2, changed 0, unchanged 0, removed 0
+$ sudo ./target/release/vantage-5G apply -f /tmp/p.conf                 # again: state kept
+[+] applied /tmp/p.conf: added 0, changed 0, unchanged 2, removed 0
+$ sudo ./target/release/vantage-5G apply -f /tmp/q.conf --replace       # .23 changed, .9 only set by CLI
+    - 10.45.1.9        removed
+    ~ 10.45.1.23       rx=10 Mbps tx=30 Mbps  changed
+[+] applied /tmp/q.conf (--replace): added 0, changed 1, unchanged 1, removed 1
+```
+
+Invalid file (exit 1, nothing changed; every error is listed, `-` is the name for stdin; quoted tokens are cut to 64 characters and escaped):
+
+```
+[-] -: 4 error(s); nothing was changed:
+      line 2: duplicate UE 10.45.1.23 (first on line 1)
+      line 3: "10.45.1.300" is not an IPv4 address
+      line 4: rx_mbps "1.5" is not a non-negative integer (Mbps)
+      line 5: expected `<UE_IPv4> <rx_mbps> <tx_mbps>`, got 2 field(s): "10.45.1.6 1"
+Error: invalid policy file -
+```
+
+Exit codes: `0` applied; `1` file unreadable (`Error: read policy file <path>` / `No such file or directory`), invalid file (above), pins missing (`open pinned ue_policy_map (run `vantage-5G load` first; needs root)`; the file is checked before this, so a bad file is reported even when nothing is loaded), too many policies (`<file>: applying would leave N policies, ue_policy_map holds at most 1024; nothing was changed`), an empty file with `--replace` (`<file> has no policies; --replace would remove all N current policies (pass --allow-empty if that is intended); nothing was changed`), the writer lock held for 30 s (`another vantage-5G set/reset/apply still holds /run/vantage-5g.lock after 30 s; nothing was changed`), or a map error during the writes (`[-] apply <file> stopped part-way (done so far: added …, changed …, unchanged …, removed …)`, then the error; the lines printed before show what was done); `2` argument error (e.g. `-f` missing: `error: the following required arguments were not provided:` / `--file <FILE>`; `--allow-empty` without `--replace`: the same error naming `--replace`).
+
+### 12.11 `export`
+
+```
+$ ./target/release/vantage-5G export --help
+Print the current policies in the `apply` file format (sorted by UE IP)
+
+Usage: vantage-5G export
+
+Options:
+  -h, --help  Print help
+
+$ sudo ./target/release/vantage-5G export
+# Vantage-5G policies (vantage-5G export): <UE_IPv4> <rx_mbps> <tx_mbps>
+# rx_mbps=0: RX uncapped, tx_mbps=0: DL blocked (killswitch)
+10.45.1.23            10      30
+10.45.1.24             3       0
+10.45.1.100            1       2
+```
+
+Two comment lines, then one line per UE sorted numerically by address (an empty map prints only the two comment lines). A policy that is not a whole number of Mbps (only possible when something other than `set`/`apply` wrote the map) is printed rounded down with a `[!] <ip>: rx_bps=… tx_bps=… is not a whole Mbps; exported rounded down` warning on stderr. Exit `1` with the `open pinned ue_policy_map …` error when nothing is loaded. To save into a file that is in use (e.g. the service's `policies.conf`), write to a temporary file and `mv` it (§5a).
+
 ## 13. Local development & testing
 
 The repository carries a local test harness so that changes can be checked before they reach a physical server. Details, every environment variable, the emulated topology and how to read results: [`testbed/README.md`](testbed/README.md).
@@ -824,7 +995,7 @@ The repository carries a local test harness so that changes can be checked befor
 |---|---|---|---|
 | L0 | any host with Python 3 | `python3 .claude/skills/vantage-boundary-check/scripts/contract_check.py .` | Static consistency: BPF C structs ↔ Rust, map/program names, pin paths, metrics ↔ this README |
 | L1 | Docker (privileged Ubuntu 24.04 container) | `./testbed/l1-docker.sh` | Build, verifier, `load`/`unload`, attach, uplink policing, killswitch, `reset`, upgrade paths. No `sch_fq` in Docker Desktop: `setup.sh` and downlink pacing are skipped |
-| L2 | VirtualBox Ubuntu VM (24.04 or 22.04) | `./testbed/l2-vbox.sh`, `VT_RELEASE=jammy ./testbed/l2-vbox.sh` | Everything in L1 plus `setup.sh` (also `--xdp-mode native` and a multi-queue N6 with `VT_N6_TXQ`) and §8's four concurrent sessions on an emulated N6 |
+| L2 | VirtualBox Ubuntu VM (24.04 or 22.04) | `./testbed/l2-vbox.sh`, `VT_RELEASE=jammy ./testbed/l2-vbox.sh` | Everything in L1 plus `setup.sh` (also `--xdp-mode native` and a multi-queue N6 with `VT_N6_TXQ`) and §8's four concurrent sessions on an emulated N6. `./testbed/l2-systemd.sh`: the §5a service install, reload/stop/restart, failure paths and `uninstall`, across a reboot |
 | L3 | Open5GS + UERANSIM VM and the L2 service VM | `./testbed/l3-vbox.sh up`, `./testbed/l3-vbox.sh test` | Real UE addresses through a 5G core: the quickstart NAT failure, §3.2 (1) both methods, (2) with a `FORWARD ACCEPT` policy, (3) with `ip route add`, the end-to-end check, §8 with `iperf3 -B <UE IP>`, killswitch. Not exercised: making (1)–(3) persistent (ufw / `iptables-persistent` / netplan) and the `FORWARD DROP` case |
 | L4 | physical server | [`docs/install-runbook.md`](docs/install-runbook.md) | Real NIC, driver and core |
 
@@ -834,4 +1005,4 @@ One-off commands in the dev container: `./testbed/dev.sh 'make build'`.
 
 - Phase 2: replace `ue_policy_map` with an `LPM_TRIE` keyed on `(ue_ip, svc_ip, port, proto)` for micro-segmentation, longest-match semantics.
 - Grafana dashboard JSON under `dashboards/`.
-- Optional systemd unit for `load` at boot.
+- ~~Optional systemd unit for `load` at boot.~~ Done: `install.sh` + `systemd/` (§5a), with policy files (`apply`/`export`, §6.1).

@@ -4,7 +4,7 @@
 
 **트리거:** Vantage-5G 기능 개발·버그 수정·코드 리뷰·로컬 테스트·설치 런북·측정 결과 분석·README 동기화 요청 시 `vantage-orchestrator` 스킬을 사용하라. 단순 질문은 직접 응답 가능.
 
-**검증 레벨:** 호스트는 macOS(직접 빌드 불가). L1 `testbed/l1-docker.sh`(Docker Desktop, sch_fq 없음 → TX 페이싱 SKIP), L2 `testbed/l2-vbox.sh`(VirtualBox Ubuntu 24.04 VM, 전체), L3 Open5GS+UERANSIM(미구축), L4 물리 서버(런북). 실행하지 않은 레벨은 성공으로 보고하지 마라. 레거시 파일(`vantage_datapath*.c`, `vantage_dynamic_edt.c`, `vantage_ringbuf_edt.c`, `ready.sh`, `README_old.md`, `history.md`)은 읽기 전용이다.
+**검증 레벨:** 호스트는 macOS(직접 빌드 불가). L1 `testbed/l1-docker.sh`(Docker Desktop, sch_fq 없음 → TX 페이싱 SKIP), L2 `testbed/l2-vbox.sh`(VirtualBox Ubuntu 24.04 / `VT_RELEASE=jammy` 22.04 VM, 전체), L3 `testbed/l3-vbox.sh`(Open5GS 레퍼런스 + UERANSIM, UPF와 서비스 노드 분리), L4 물리 서버(`docs/install-runbook.md`). 실행하지 않은 레벨은 성공으로 보고하지 마라. VirtualBox VM은 동시에 하나만 켜는 것이 원칙이다(호스트 경합 시 타이머 열화로 처리량 판정 무효 — `timer-health.txt`가 OK일 때만 처리량을 판정). 레거시 파일(`vantage_datapath*.c`, `vantage_dynamic_edt.c`, `vantage_ringbuf_edt.c`, `ready.sh`, `README_old.md`, `history.md`)은 읽기 전용이다.
 
 **변경 이력:**
 | 날짜 | 변경 내용 | 대상 | 사유 |
@@ -22,3 +22,5 @@
 | 2026-10-19 | 처리량 판정에 counter 기반 보조 판정(counter_verdict.py), 회귀 단계(D4/D6/D7/D16/D25/D26/업그레이드) 추가, L4 설치 런북을 docs/로 | testbed/, skills/vantage-testbed, docs/ | 3·4차 결함 수정 검증, X3 B안(cap=L2 전체 바이트) |
 | 2026-10-19 | L2 VM 격리 규칙 강화(라우팅·sysctl·bpffs 공유 → 테스트 중 VM 접근 금지) | skills/vantage-orchestrator | 6차에서 별도 veth를 쓴 엔지니어의 10.45.1.0/24 주소가 테스트 경로를 가로채 실행 1회 무효 |
 | 2026-10-20 | L3 테스트베드(Open5GS 레퍼런스 + UERANSIM, UPF/서비스 노드 분리) 구현, vantage-testbed 스킬 L3 갱신 | testbed/, skills/vantage-testbed | 로드맵 2번: 물리 서버 전 5G 경로·NAT 절차 로컬 검증 |
+| 2026-10-20 | X10 원인=VirtualBox 타이머 열화(단일 VM 원칙, timer-health 점검), 검증 레벨 서술 갱신(L2 22.04/24.04, L3 구현됨) | CLAUDE.md, testbed/ | X10 조사 결과, 오래된 서술 정정 |
+| 2026-10-20 | 로드맵 3번: apply/export, systemd 유닛, install.sh (부팅 순서 load → apply → setup.sh, 리더 승인) | src/, systemd/, install.sh | 물리 서버 재부팅 후 정책·attach 복원 |

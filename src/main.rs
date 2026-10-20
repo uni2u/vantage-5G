@@ -3,7 +3,7 @@
 // limits enforced by XDP (RX policer) and tc-bpf EDT (TX pacer) attached
 // to the service-node N6-facing NIC.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::mem::size_of;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -165,6 +165,23 @@ enum Cmd {
     /// Print every UE currently in the policy map.
     List,
 
+    /// Apply a policy file: one `<UE_IPv4> <rx_mbps> <tx_mbps>` per line,
+    /// `#` starts a comment. The whole file is validated before anything is
+    /// changed. Each UE gets `set` semantics (same values = state kept).
+    /// With --replace, policies of UEs not in the file are reset.
+    Apply {
+        /// Policy file (`-` = stdin)
+        #[arg(short = 'f', long = "file", value_name = "FILE")] file: PathBuf,
+        /// Also reset every policy not listed in the file
+        #[arg(long)] replace: bool,
+        /// With --replace: allow a file with no policies to remove every
+        /// current policy (refused otherwise, to catch an empty/truncated file)
+        #[arg(long, requires = "replace")] allow_empty: bool,
+    },
+
+    /// Print the current policies in the `apply` file format (sorted by UE IP).
+    Export,
+
     /// Print RX/TX counters for one UE (or all UEs when --ue-ip is omitted).
     Stats {
         #[arg(long)] ue_ip: Option<Ipv4Addr>,
@@ -190,6 +207,8 @@ fn main() -> Result<()> {
         Cmd::Set { ue_ip, rx_mbps, tx_mbps }     => cmd_set(ue_ip, rx_mbps, tx_mbps),
         Cmd::Reset { ue_ip }                     => cmd_reset(ue_ip),
         Cmd::List                                => cmd_list(),
+        Cmd::Apply { file, replace, allow_empty } => cmd_apply(&file, replace, allow_empty),
+        Cmd::Export                              => cmd_export(),
         Cmd::Stats { ue_ip }                     => cmd_stats(ue_ip),
         Cmd::Monitor { bind, port, scrape_ms }   => cmd_monitor(bind, port, scrape_ms),
     }
@@ -203,7 +222,7 @@ fn cmd_load(obj_dir: Option<PathBuf>) -> Result<()> {
     load_and_pin(&dir, OBJ_RX, PROG_RX_NAME)?;
     load_and_pin(&dir, OBJ_TX, PROG_TX_NAME)?;
     println!("[+] Vantage-5G loaded. Pins under {}", BPF_PIN_DIR);
-    println!("    Attach with: sudo ./setup.sh <iface>");
+    println!("    Attach with: sudo {}/setup.sh <iface>", hint_paths().1);
     Ok(())
 }
 
@@ -254,10 +273,35 @@ fn find_obj_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
     bail!("BPF object files not found");
 }
 
-const UPGRADE_HINT: &str = "upgrade procedure (map definitions changed in the .o):\n      \
-     sudo ./detach.sh <iface>; sudo ./target/release/vantage-5G unload;\n      \
-     sudo ./target/release/vantage-5G load; sudo ./setup.sh <iface>\n    \
-     (policies are lost: re-run `set` for every UE afterwards)";
+/// Paths for operator hints, based on where this binary actually is:
+/// (this executable, directory holding setup.sh/detach.sh). Installed copy:
+/// /usr/local/lib/vantage-5g/{vantage-5G,setup.sh,detach.sh}; repository
+/// build: <repo>/target/release/vantage-5G with the scripts at <repo>.
+fn hint_paths() -> (String, String) {
+    let exe = std::env::current_exe().and_then(|p| p.canonicalize()).ok();
+    let exe_s = exe.as_ref().map(|p| p.display().to_string())
+        .unwrap_or_else(|| "vantage-5G".into());
+    let scripts = exe.as_ref().and_then(|e| e.parent()).and_then(|d| {
+        [Some(d), d.parent().and_then(Path::parent)].into_iter().flatten()
+            .find(|c| c.join("detach.sh").is_file())
+            .map(|c| c.display().to_string())
+    }).unwrap_or_else(|| ".".into());
+    (exe_s, scripts)
+}
+
+fn upgrade_hint() -> String {
+    let (exe, sd) = hint_paths();
+    format!("upgrade procedure (map definitions changed in the .o):\n      \
+             with the systemd service: sudo systemctl restart {svc}\n      \
+               (policies are restored from {pol})\n      \
+             by hand: sudo {sd}/detach.sh <iface>; sudo {exe} unload;\n      \
+               sudo {exe} load; sudo {sd}/setup.sh <iface>\n      \
+               (policies are lost: `sudo {exe} apply -f <file>` or `set` for every UE afterwards)",
+            svc = SERVICE_UNIT, pol = SERVICE_POLICY_FILE, sd = sd, exe = exe)
+}
+
+const SERVICE_UNIT: &str = "vantage-5g";
+const SERVICE_POLICY_FILE: &str = "/etc/vantage-5g/policies.conf";
 
 fn cmd_unload() -> Result<()> {
     let root = Path::new(BPF_PIN_DIR);
@@ -283,8 +327,9 @@ fn cmd_unload() -> Result<()> {
         }
         let mut ifs: Vec<&str> = attached.iter().map(|a| a.ifname.as_str()).collect();
         ifs.dedup();
+        let sd = hint_paths().1;
         for i in ifs {
-            eprintln!("    run: sudo ./detach.sh {}", i);
+            eprintln!("    run: sudo {}/detach.sh {}", sd, i);
         }
         bail!("refusing to unload while attached (pins left untouched)");
     }
@@ -513,7 +558,7 @@ fn load_and_pin(dir: &Path, obj_file: &str, prog_name: &str) -> Result<()> {
         for l in &mism {
             eprintln!("      {}", l);
         }
-        eprintln!("    {}", UPGRADE_HINT);
+        eprintln!("    {}", upgrade_hint());
         bail!("pinned map definition mismatch for {}", obj_file);
     }
 
@@ -531,7 +576,7 @@ fn load_and_pin(dir: &Path, obj_file: &str, prog_name: &str) -> Result<()> {
                 ErrorKind::InvalidInput => format!(
                     "load {}: EINVAL. Either the verifier rejected a program (see the libbpf log \
                      above) or a pinned map under {} could not be reused (\"parameter mismatch\" \
-                     above); for the latter: {}", obj_file, BPF_PIN_DIR, UPGRADE_HINT),
+                     above); for the latter: {}", obj_file, BPF_PIN_DIR, upgrade_hint()),
                 ErrorKind::PermissionDenied => format!(
                     "load {}: permission denied (needs root / CAP_BPF+CAP_NET_ADMIN), or the \
                      verifier rejected a program (EACCES, see the libbpf log above)", obj_file),
@@ -595,52 +640,309 @@ fn clear_ue_state(key: &[u8]) -> Result<()> {
     Ok(())
 }
 
-// ---------- set / reset ----------
-fn cmd_set(ue_ip: Ipv4Addr, rx_mbps: u64, tx_mbps: u64) -> Result<()> {
-    let map = open_policy_map()?;
-    let key = ue_ip_key(ue_ip);
-    // clap bounds both values to 0..=MAX_MBPS, so the products fit easily.
-    let val = UePolicy {
-        rx_bps: rx_mbps * 1_000_000,
-        tx_bps: tx_mbps * 1_000_000,
-    };
-    // D26: re-applying the same policy (periodic reconcile, boot scripts)
-    // must not refill the RX bucket or forget the TX backlog each time.
-    let unchanged = match map.lookup(&key, MapFlags::empty())
-        .with_context(|| format!("lookup ue_policy_map for {}", ue_ip))?
-    {
-        Some(b) => {
-            let old: UePolicy = from_bytes(&b);
-            old.rx_bps == val.rx_bps && old.tx_bps == val.tx_bps
+// ---------- writer lock (set / reset / apply) ----------
+//
+// Writers read the policy map, decide (D26 unchanged? capacity?) and write.
+// Two of them interleaving -- `systemctl reload` (apply --replace) next to an
+// operator's `set` -- could re-write a value another writer just changed
+// without clearing its state, or fail half-way on a full map. They serialise
+// on an flock. /run (tmpfs) rather than the service's RuntimeDirectory so the
+// CLI used without systemd takes the same lock.
+const LOCK_PATH: &str = "/run/vantage-5g.lock";
+const LOCK_WAIT: Duration = Duration::from_secs(30);
+
+fn writer_lock() -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+        .mode(0o600).open(LOCK_PATH)
+        .with_context(|| format!("open lock {} (needs root)", LOCK_PATH))?;
+    let start = std::time::Instant::now();
+    let mut said = false;
+    loop {
+        match f.try_lock() {
+            Ok(()) => return Ok(f),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(e)) =>
+                return Err(e).with_context(|| format!("lock {}", LOCK_PATH)),
         }
-        None => false,
+        if start.elapsed() >= LOCK_WAIT {
+            bail!("another vantage-5G set/reset/apply still holds {} after {} s; nothing was changed",
+                  LOCK_PATH, LOCK_WAIT.as_secs());
+        }
+        if !said {
+            eprintln!("[i] waiting for {} (another set/reset/apply is running)", LOCK_PATH);
+            said = true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+// ---------- set / reset ----------
+fn mbps_policy(rx_mbps: u64, tx_mbps: u64) -> UePolicy {
+    // Callers bound both values to 0..=MAX_MBPS, so the products fit easily.
+    UePolicy { rx_bps: rx_mbps * 1_000_000, tx_bps: tx_mbps * 1_000_000 }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum SetOutcome { Added, Changed, Unchanged }
+
+/// Write the policy for `key`; `old` is its current value (None = absent).
+/// D26: re-applying the same policy (periodic reconcile, boot scripts, apply)
+/// must not refill the RX bucket or forget the TX backlog, so the per-UE
+/// state is only cleared when the value actually changes.
+fn write_policy(map: &MapHandle, ue_ip: Ipv4Addr, old: Option<UePolicy>, val: UePolicy)
+    -> Result<SetOutcome>
+{
+    let key = ue_ip_key(ue_ip);
+    let outcome = match old {
+        None => SetOutcome::Added,
+        Some(o) if o.rx_bps == val.rx_bps && o.tx_bps == val.tx_bps => SetOutcome::Unchanged,
+        Some(_) => SetOutcome::Changed,
     };
     map.update(&key, as_bytes(&val), MapFlags::ANY)
         .with_context(|| format!("update ue_policy_map for {}", ue_ip))?;
-    if !unchanged {
+    if outcome != SetOutcome::Unchanged {
         // Policy first, then state: a packet racing in between re-creates the
         // state under the new policy.
         clear_ue_state(&key)
             .with_context(|| format!("policy for {} WAS updated, but clearing its rx/tx state failed", ue_ip))?;
     }
+    Ok(outcome)
+}
+
+/// Delete the policy of `ue_ip` and its per-UE state. Ok(existed).
+fn remove_policy(map: &MapHandle, ue_ip: Ipv4Addr) -> Result<bool> {
+    let key = ue_ip_key(ue_ip);
+    let existed = delete_key(map, &key)
+        .with_context(|| format!("reset policy for {}", ue_ip))?;
+    clear_ue_state(&key)
+        .with_context(|| format!("clear rx/tx state for {}", ue_ip))?;
+    Ok(existed)
+}
+
+fn lookup_policy(map: &MapHandle, ue_ip: Ipv4Addr) -> Result<Option<UePolicy>> {
+    Ok(map.lookup(&ue_ip_key(ue_ip), MapFlags::empty())
+        .with_context(|| format!("lookup ue_policy_map for {}", ue_ip))?
+        .map(|b| from_bytes::<UePolicy>(&b)))
+}
+
+/// Every policy in the map, keyed by UE IP (sorted numerically).
+fn read_all_policies(map: &MapHandle) -> Result<BTreeMap<Ipv4Addr, UePolicy>> {
+    let mut out = BTreeMap::new();
+    for key in map.keys() {
+        let Some(b) = map.lookup(&key, MapFlags::empty())
+            .with_context(|| format!("lookup {}", MAP_POLICY))? else { continue };  // deleted mid-scan
+        out.insert(key_to_ip(&key)?, from_bytes::<UePolicy>(&b));
+    }
+    Ok(out)
+}
+
+fn cmd_set(ue_ip: Ipv4Addr, rx_mbps: u64, tx_mbps: u64) -> Result<()> {
+    let map = open_policy_map()?;
+    let _lock = writer_lock()?;
+    let old = lookup_policy(&map, ue_ip)?;
+    let outcome = write_policy(&map, ue_ip, old, mbps_policy(rx_mbps, tx_mbps))?;
     println!("[+] policy set: UE {} rx={} Mbps tx={} Mbps{}{}",
              ue_ip, rx_mbps, tx_mbps,
              if tx_mbps == 0 { "  (killswitch: DL blocked)" } else { "" },
-             if unchanged { "  (unchanged; rx/tx state kept)" } else { "" });
+             if outcome == SetOutcome::Unchanged { "  (unchanged; rx/tx state kept)" } else { "" });
     Ok(())
 }
 
 fn cmd_reset(ue_ip: Ipv4Addr) -> Result<()> {
     let map = open_policy_map()?;
-    let key = ue_ip_key(ue_ip);
-    let existed = delete_key(&map, &key)
-        .with_context(|| format!("reset policy for {}", ue_ip))?;
-    clear_ue_state(&key)
-        .with_context(|| format!("clear rx/tx state for {}", ue_ip))?;
-    if existed {
+    let _lock = writer_lock()?;
+    if remove_policy(&map, ue_ip)? {
         println!("[+] policy cleared for UE {}", ue_ip);
     } else {
         println!("[i] no policy for UE {} (nothing to clear)", ue_ip);
+    }
+    Ok(())
+}
+
+// ---------- apply / export (policy file) ----------
+//
+// Format (also what `export` prints):
+//   <UE_IPv4> <rx_mbps> <tx_mbps>     whitespace (spaces/tabs) separated
+//   # comment                         `#` to end of line; blank lines ignored
+// Values as for `set`: integer Mbps 0..=MAX_MBPS. A UE listed twice is an
+// error. The file is fully parsed and checked before the map is touched.
+
+#[derive(Debug)]
+struct PolicyLine {
+    line:    usize,
+    ue_ip:   Ipv4Addr,
+    rx_mbps: u64,
+    tx_mbps: u64,
+}
+
+/// File text for an error message: at most SHOW_MAX chars, escaped ({:?})
+/// so invisible characters (BOM, NBSP, control chars) show up.
+const SHOW_MAX: usize = 64;
+fn show(s: &str) -> String {
+    let n = s.chars().count();
+    if n <= SHOW_MAX {
+        format!("{:?}", s)
+    } else {
+        let head: String = s.chars().take(SHOW_MAX).collect();
+        format!("{:?}... ({} chars)", head, n)
+    }
+}
+
+fn parse_mbps(tok: &str, what: &str) -> std::result::Result<u64, String> {
+    // Plain decimal digits only (u64::from_str would also take "+5").
+    if tok.is_empty() || !tok.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("{} {} is not a non-negative integer (Mbps)", what, show(tok)));
+    }
+    match tok.parse::<u64>() {
+        Ok(v) if v <= MAX_MBPS => Ok(v),
+        _ => Err(format!("{} {} out of range 0..={}", what, show(tok), MAX_MBPS)),
+    }
+}
+
+/// Parse a whole policy file. Err lists every problem found (with line numbers).
+fn parse_policy_file(text: &str) -> std::result::Result<Vec<PolicyLine>, Vec<String>> {
+    let mut out = Vec::new();
+    let mut errs = Vec::new();
+    let mut first_line: HashMap<Ipv4Addr, usize> = HashMap::new();
+    // A UTF-8 BOM (Windows editors) would otherwise glue onto the first token.
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
+    for (i, raw) in text.lines().enumerate() {
+        let n = i + 1;
+        let body = raw.split('#').next().unwrap_or("");
+        let toks: Vec<&str> = body.split_whitespace().collect();
+        if toks.is_empty() {
+            continue;
+        }
+        if toks.len() != 3 {
+            errs.push(format!("line {}: expected `<UE_IPv4> <rx_mbps> <tx_mbps>`, got {} field(s): {}",
+                              n, toks.len(), show(raw.trim())));
+            continue;
+        }
+        let ip = toks[0].parse::<Ipv4Addr>()
+            .map_err(|_| format!("line {}: {} is not an IPv4 address", n, show(toks[0])));
+        let rx = parse_mbps(toks[1], "rx_mbps").map_err(|e| format!("line {}: {}", n, e));
+        let tx = parse_mbps(toks[2], "tx_mbps").map_err(|e| format!("line {}: {}", n, e));
+        match (ip, rx, tx) {
+            (Ok(ue_ip), Ok(rx_mbps), Ok(tx_mbps)) => {
+                if let Some(prev) = first_line.get(&ue_ip) {
+                    errs.push(format!("line {}: duplicate UE {} (first on line {})", n, ue_ip, prev));
+                    continue;
+                }
+                first_line.insert(ue_ip, n);
+                out.push(PolicyLine { line: n, ue_ip, rx_mbps, tx_mbps });
+            }
+            (ip, rx, tx) => {
+                errs.extend([ip.err(), rx.err(), tx.err()].into_iter().flatten());
+            }
+        }
+    }
+    if errs.is_empty() { Ok(out) } else { Err(errs) }
+}
+
+fn read_policy_source(file: &Path) -> Result<String> {
+    if file.as_os_str() == "-" {
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut s).context("read policies from stdin")?;
+        Ok(s)
+    } else {
+        std::fs::read_to_string(file).with_context(|| format!("read policy file {}", file.display()))
+    }
+}
+
+fn cmd_apply(file: &Path, replace: bool, allow_empty: bool) -> Result<()> {
+    let text = read_policy_source(file)?;
+    let entries = match parse_policy_file(&text) {
+        Ok(e) => e,
+        Err(errs) => {
+            eprintln!("[-] {}: {} error(s); nothing was changed:", file.display(), errs.len());
+            for e in &errs {
+                eprintln!("      {}", e);
+            }
+            bail!("invalid policy file {}", file.display());
+        }
+    };
+
+    let map = open_policy_map()?;
+    let _lock = writer_lock()?;
+    let current = read_all_policies(&map)?;
+    // O-8a: an empty or truncated file (failed `export >` redirect, full disk)
+    // with --replace would silently drop every policy, killswitches included.
+    if replace && entries.is_empty() && !current.is_empty() && !allow_empty {
+        bail!("{} has no policies; --replace would remove all {} current policies \
+               (pass --allow-empty if that is intended); nothing was changed",
+              file.display(), current.len());
+    }
+    let wanted: HashSet<Ipv4Addr> = entries.iter().map(|e| e.ue_ip).collect();
+    let to_remove: Vec<Ipv4Addr> = if replace {
+        current.keys().filter(|ip| !wanted.contains(ip)).copied().collect()
+    } else {
+        Vec::new()
+    };
+
+    // Capacity: ue_policy_map is a plain HASH (no eviction); an update past
+    // max_entries fails with E2BIG half-way through. Check before changing
+    // anything so a too-large file is a validation error, not a partial apply.
+    let max = map.info().context("info of ue_policy_map")?.info.max_entries as usize;
+    let added = entries.iter().filter(|e| !current.contains_key(&e.ue_ip)).count();
+    let final_n = current.len() - to_remove.len() + added;
+    if final_n > max {
+        bail!("{}: applying would leave {} policies, {} holds at most {}; nothing was changed",
+              file.display(), final_n, MAP_POLICY, max);
+    }
+
+    // From here on the map is changed. A failure (EPERM, map removed by a
+    // concurrent unload, ...) stops the run; what was done so far is printed.
+    let mut n = [0usize; 4]; // added, changed, unchanged, removed
+    let summary = |n: &[usize; 4]| format!("added {}, changed {}, unchanged {}, removed {}",
+                                           n[0], n[1], n[2], n[3]);
+    let mut run = || -> Result<()> {
+        // Removals first so that a full map has room for the additions.
+        for ip in &to_remove {
+            remove_policy(&map, *ip)?;
+            n[3] += 1;
+            println!("    - {:<16} removed", ip);
+        }
+        for e in &entries {
+            let val = mbps_policy(e.rx_mbps, e.tx_mbps);
+            let outcome = write_policy(&map, e.ue_ip, current.get(&e.ue_ip).copied(), val)
+                .with_context(|| format!("line {}", e.line))?;
+            let (idx, tag) = match outcome {
+                SetOutcome::Added => (0, "added"),
+                SetOutcome::Changed => (1, "changed"),
+                SetOutcome::Unchanged => (2, "unchanged (rx/tx state kept)"),
+            };
+            n[idx] += 1;
+            if outcome != SetOutcome::Unchanged {
+                println!("    {} {:<16} rx={} Mbps tx={} Mbps{}  {}",
+                         if outcome == SetOutcome::Added { "+" } else { "~" },
+                         e.ue_ip, e.rx_mbps, e.tx_mbps,
+                         if e.tx_mbps == 0 { " (killswitch)" } else { "" }, tag);
+            }
+        }
+        Ok(())
+    };
+    if let Err(e) = run() {
+        eprintln!("[-] apply {} stopped part-way (done so far: {})", file.display(), summary(&n));
+        return Err(e);
+    }
+    println!("[+] applied {}{}: {}", file.display(), if replace { " (--replace)" } else { "" }, summary(&n));
+    Ok(())
+}
+
+fn cmd_export() -> Result<()> {
+    let map = open_policy_map()?;
+    let pols = read_all_policies(&map)?;
+    println!("# Vantage-5G policies (vantage-5G export): <UE_IPv4> <rx_mbps> <tx_mbps>");
+    println!("# rx_mbps=0: RX uncapped, tx_mbps=0: DL blocked (killswitch)");
+    for (ip, p) in &pols {
+        // `set`/`apply` only write whole Mbps; anything else came from
+        // another writer and cannot be represented exactly.
+        if p.rx_bps % 1_000_000 != 0 || p.tx_bps % 1_000_000 != 0 {
+            eprintln!("[!] {}: rx_bps={} tx_bps={} is not a whole Mbps; exported rounded down",
+                      ip, p.rx_bps, p.tx_bps);
+        }
+        println!("{:<16} {:>7} {:>7}", ip, p.rx_bps / 1_000_000, p.tx_bps / 1_000_000);
     }
     Ok(())
 }
@@ -865,5 +1167,74 @@ fn set_counter(cv: &CounterVec, label: &str, value: u64) {
     let cur = c.get();
     if want > cur {
         c.inc_by(want - cur);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_ok_comments_blank_tabs() {
+        let t = "# header\n\n10.45.1.23 10 20   # trailing\n\t10.45.1.24\t0\t0\n   \n10.45.1.25 400000 1\n";
+        let v = parse_policy_file(t).unwrap();
+        assert_eq!(v.len(), 3);
+        assert_eq!((v[0].line, v[0].ue_ip, v[0].rx_mbps, v[0].tx_mbps),
+                   (3, Ipv4Addr::new(10, 45, 1, 23), 10, 20));
+        assert_eq!((v[1].rx_mbps, v[1].tx_mbps), (0, 0));
+        assert_eq!(v[2].rx_mbps, MAX_MBPS);
+    }
+
+    #[test]
+    fn parse_empty_file() {
+        assert!(parse_policy_file("").unwrap().is_empty());
+        assert!(parse_policy_file("# only comments\n\n").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_errors_all_reported_with_lines() {
+        let t = "10.45.1.23 10 20\n10.45.1.23 1 1\n10.45.1.300 1 1\n10.45.1.26 400001 1\n10.45.1.27 -1 +5\n10.45.1.28 1\n10.45.1.29 1 2 3\n10.45.1.30 1.5 2\n";
+        let e = parse_policy_file(t).unwrap_err();
+        let all = e.join("\n");
+        assert!(all.contains("line 2: duplicate UE 10.45.1.23 (first on line 1)"), "{}", all);
+        assert!(all.contains("line 3: \"10.45.1.300\" is not an IPv4 address"), "{}", all);
+        assert!(all.contains("line 4: rx_mbps \"400001\" out of range"), "{}", all);
+        assert!(all.contains("line 5: rx_mbps \"-1\""), "{}", all);
+        assert!(all.contains("line 5: tx_mbps \"+5\""), "{}", all);
+        assert!(all.contains("line 6: expected"), "{}", all);
+        assert!(all.contains("line 7: expected"), "{}", all);
+        assert!(all.contains("line 8: rx_mbps \"1.5\""), "{}", all);
+        assert_eq!(e.len(), 8, "{}", all);
+    }
+
+    #[test]
+    fn parse_rejects_huge_and_odd_ip_forms() {
+        assert!(parse_policy_file("10.45.1.1 99999999999999999999999 1\n").is_err());
+        // Ipv4Addr::from_str is strict: no shorthand / leading zeros.
+        assert!(parse_policy_file("10.1 1 1\n").is_err());
+        assert!(parse_policy_file("010.45.1.1 1 1\n").is_err());
+    }
+
+    #[test]
+    fn parse_strips_bom_only_at_start() {
+        let v = parse_policy_file("\u{FEFF}10.45.1.23 10 20\n").unwrap();
+        assert_eq!(v[0].ue_ip, Ipv4Addr::new(10, 45, 1, 23));
+        let v = parse_policy_file("\u{FEFF}# hdr\n10.45.1.23 1 2\n").unwrap();
+        assert_eq!(v.len(), 1);
+        // A BOM elsewhere is not stripped, and is shown escaped.
+        let e = parse_policy_file("10.45.1.1 1 1\n\u{FEFF}10.45.1.2 1 1\n").unwrap_err();
+        assert!(e[0].contains("\\u{feff}"), "{:?}", e);
+    }
+
+    #[test]
+    fn error_tokens_truncated_and_escaped() {
+        let long = "9".repeat(2_000_000);
+        let e = parse_policy_file(&format!("10.45.1.1 {} 1\n", long)).unwrap_err();
+        assert!(e[0].len() < 200, "{} bytes", e[0].len());
+        assert!(e[0].contains("... (2000000 chars)"), "{}", e[0]);
+        let e = parse_policy_file(&format!("{} 1 1 1\n", "x".repeat(500))).unwrap_err();
+        assert!(e[0].len() < 250 && e[0].contains("chars)"), "{}", e[0]);
+        let e = parse_policy_file("10.45.1.1\t1\t\u{7}\n").unwrap_err();
+        assert!(e[0].contains("\\u{7}"), "{}", e[0]);
     }
 }
