@@ -22,6 +22,13 @@ SUDO=""
 
 PIN_DIR="/sys/fs/bpf/vantage"
 
+# Paths for operator hints: where this script and the CLI actually are
+# (repository checkout, or /usr/local/lib/vantage-5g when installed).
+SELF_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+if [[ -x "${SELF_DIR}/vantage-5G" ]]; then CLI="${SELF_DIR}/vantage-5G"
+elif [[ -x "${SELF_DIR}/target/release/vantage-5G" ]]; then CLI="${SELF_DIR}/target/release/vantage-5G"
+else CLI="vantage-5G"; fi
+
 # Reads below need no privilege (and must not depend on sudo working).
 if ! ip link show dev "${IFACE}" >/dev/null 2>&1; then
     echo "[-] interface ${IFACE} not found"
@@ -79,4 +86,4 @@ if [[ "${LEFT}" -ne 0 ]]; then
 fi
 
 echo "[+] ${IFACE} detached. Pinned programs and maps are still in ${PIN_DIR}."
-echo "    Run 'sudo ./target/release/vantage-5G unload' to fully remove them."
+echo "    Run 'sudo ${CLI} unload' to fully remove them."

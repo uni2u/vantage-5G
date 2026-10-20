@@ -60,6 +60,14 @@ rsync -a --delete -e "ssh ${SSH_OPTS[*]}" --exclude target --exclude '_workspace
 # Tested tree: HEAD plus "-dirty" when tracked files have uncommitted changes.
 git -C "${ROOT}" describe --always --dirty > "${OUT}/commit.txt" 2>/dev/null || echo no-git > "${OUT}/commit.txt"
 echo "release=${REL} vm=${VM}" >> "${OUT}/commit.txt"
+# Timer-health preflight (X10): record host contention; throughput verdicts are only meaningful
+# when this says OK. Informational, never fails the run.
+vm_timer_health > "${OUT}/timer-health.txt" 2>&1
+th=$(tail -1 "${OUT}/timer-health.txt")
+case "${th}" in
+    *DEGRADED*) echo "[!] ${th} -- throughput rows will under-deliver (environment, X10); see ${OUT}/timer-health.txt" ;;
+    *) echo "[i] ${th}" ;;
+esac
 PASS_ENV=""
 for v in VT_SETUP_AS VT_NONROOT_USER VT_NO_BPFTOOL VT_NAT VT_NETEM VT_XDP_MODE VT_N6_TXQ VT_N6_TXQ_MAX; do
     [[ -n "${!v:-}" ]] && PASS_ENV+=" ${v}=$(printf %q "${!v}")"

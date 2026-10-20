@@ -1,0 +1,38 @@
+# vantage-5g-monitor.service -- Prometheus exporter (installed by install.sh)
+# After= vantage-5g.service only (no Wants=/Requires=): both units start at
+# boot through their own WantedBy=multi-user.target. Starting or restarting the
+# monitor never starts a stopped vantage-5g (no unintended load/attach during
+# maintenance), and the monitor keeps running when vantage-5g fails to start,
+# is stopped, or fails to stop (the state an operator most wants to see).
+# vantage-5g is not restarted with the monitor either: after editing
+# MONITOR_ARGS or upgrading, run `systemctl restart vantage-5g-monitor`.
+# `monitor` re-opens the pins on every scrape (D8): while vantage-5g is down it
+# logs the scrape error once and drops the series; after a restart it re-reads
+# the new maps without being restarted itself.
+# Arguments: MONITOR_ARGS in /etc/vantage-5g/vantage-5g.env (the example binds
+# 127.0.0.1; without --bind the CLI listens on 0.0.0.0, N6 side included).
+[Unit]
+Description=Vantage-5G Prometheus exporter
+After=vantage-5g.service
+# Port taken / persistent failure: give up after 10 restarts in 5 min instead
+# of retrying every 5 s forever (`systemctl reset-failed` + start to retry).
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+Environment=MONITOR_ARGS=
+EnvironmentFile=-/etc/vantage-5g/vantage-5g.env
+ExecStart=/usr/local/lib/vantage-5g/vantage-5G monitor $MONITOR_ARGS
+Restart=on-failure
+RestartSec=5
+# Reads pinned maps only: CAP_BPF (bpf syscall with
+# kernel.unprivileged_bpf_disabled) + DAC_OVERRIDE (bpffs 0700 root). No
+# mount-namespace options (same reason as vantage-5g.service; libbpf opens
+# pins read-write, a read-only /sys/fs/bpf view would fail).
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_BPF CAP_DAC_OVERRIDE
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

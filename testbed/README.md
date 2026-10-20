@@ -12,6 +12,7 @@ The scripts were developed on a macOS (x86_64) host. `l2-vbox.sh` and `l3-vbox.s
 4. [l1-docker.sh — L1 run in Docker](#4-l1-dockersh--l1-run-in-docker)
 5. [l2-vbox.sh — L2 run in a VirtualBox Ubuntu VM](#5-l2-vboxsh--l2-run-in-a-virtualbox-ubuntu-vm)
 5a. [l3-vbox.sh — L3 run: Open5GS + UERANSIM and a separate service node](#5a-l3-vboxsh--l3-run-open5gs--ueransim-and-a-separate-service-node)
+5b. [l2-systemd.sh — systemd service test on an L2 VM](#5b-l2-systemdsh--systemd-service-test-on-an-l2-vm)
 6. [Environment variables](#6-environment-variables)
 7. [Emulated topology (netns-topo.sh)](#7-emulated-topology-netns-toposh)
 8. [What run-tests.sh does](#8-what-run-testssh-does)
@@ -26,7 +27,7 @@ The scripts were developed on a macOS (x86_64) host. `l2-vbox.sh` and `l3-vbox.s
 |---|---|---|---|---|
 | **L0** | any host with Python 3.8+ | `python3 .claude/skills/vantage-boundary-check/scripts/contract_check.py .` | Static contracts: C struct ↔ Rust `#[repr(C)]`, map/program names, pin paths in `setup.sh`/`detach.sh`, Prometheus metric names ↔ top-level README. Exit 1 on any FAIL | Anything that runs |
 | **L1** | Docker (Docker Desktop kernel), privileged Ubuntu 24.04 container | `./testbed/l1-docker.sh` | Build, verifier, `load` (and idempotent re-load), attach, uplink RX policing with two concurrent sessions, killswitch, `set`/`reset` state handling, `unload` guard, `detach.sh` exit codes, upgrade from older pins | `sch_fq` is missing → `setup.sh`, downlink EDT pacing and the non-root / `ingress` checks are skipped |
-| **L2** | VirtualBox VM, stock Ubuntu 24.04 (`noble`, default) or 22.04 (`jammy`) | `./testbed/l2-vbox.sh` / `VT_RELEASE=jammy ./testbed/l2-vbox.sh` | All of L1 plus `setup.sh` (re-runs without a hook gap, re-run under load, non-root user, `ingress` refusal, missing `bpftool`, `--xdp-mode` switching, multi-queue `mq` layout with `VT_N6_TXQ`), downlink pacing, the top-level README §8 four concurrent sessions and a 4-flow-per-UE downlink cap check | Real 5G path (GTP, UPF NAT), physical NIC and its driver's native XDP / hardware queues |
+| **L2** | VirtualBox VM, stock Ubuntu 24.04 (`noble`, default) or 22.04 (`jammy`) | `./testbed/l2-vbox.sh` / `VT_RELEASE=jammy ./testbed/l2-vbox.sh` | All of L1 plus `setup.sh` (re-runs without a hook gap, re-run under load, non-root user, `ingress` refusal, missing `bpftool`, `--xdp-mode` switching, multi-queue `mq` layout with `VT_N6_TXQ`), downlink pacing, the top-level README §8 four concurrent sessions and a 4-flow-per-UE downlink cap check. `./testbed/l2-systemd.sh`: the systemd service install (top-level README §5a) across a reboot (§5b) | Real 5G path (GTP, UPF NAT), physical NIC and its driver's native XDP / hardware queues |
 | **L3** | Two VirtualBox VMs: `vantage-core` (Ubuntu 22.04, Open5GS reference install + UERANSIM) and `vantage-svc` (the L2 noble VM) joined by an internal-network N6 | `./testbed/l3-vbox.sh up`, then `./testbed/l3-vbox.sh test` | Real UE addresses through a 5G core (GTP-U, UPF, `ogstun`): the quickstart NAT failure mode, top-level README §3.2 (NAT exception A and B, `ip_forward`, return route, end-to-end check) and §8 (four sessions bound with `iperf3 -B <UE IP>`, counter/iperf verdicts), killswitch, on a virtio NIC instead of veth | Physical NIC, native XDP on a real driver, hardware queues, throughput above UERANSIM's userspace GTP capacity |
 | **L4** | Physical Ubuntu server | [`docs/install-runbook.md`](../docs/install-runbook.md) (run by hand) | Real NIC, driver, multi-queue, real core | — |
 
@@ -152,6 +153,29 @@ Topology (mirrors the target deployment: the UPF host and the service node are d
 Cleanup: an exit trap (normal end, failure, Ctrl-C, ssh drop) kills background captures, runs `detach.sh <IF>` and `unload`, removes the return route and iperf3/tcpdump on vantage-svc, and puts vantage-core back to the quickstart NAT state (`nat-reference-end.log`). `killswitch` restores UE-B's policy even when one of its checks fails. `test` starts both VMs if they are off (e.g. after `down`). `VT_L3_FORCE_KS_FAIL=1` makes the killswitch step fail on purpose (harness self-test).
 
 Result directory `_workspace/l3-<ts>/`: `summary.txt`, `env.txt` (versions, addresses, host `uptime`), `commit.txt`, per-step logs, `*.tcpdump.txt`/`*.ue.txt` captures, `baseline/` and `run/` (iperf3 JSON, `spec.csv`, `stats_*.txt`, `rates.txt`, `uptime.txt`), `verdict.txt`, `verdict_counters.txt`, `tx_drops.txt`, `ctl_*` control runs.
+
+## 5b. `l2-systemd.sh` — systemd service test on an L2 VM
+
+```bash
+./testbed/l2-systemd.sh                    # noble VM (vantage-svc)
+VT_RELEASE=jammy ./testbed/l2-systemd.sh   # jammy VM (vantage-svc-jammy)
+./testbed/l2-systemd.sh cleanup            # only the cleanup step, after an aborted run
+```
+
+Tests the service install of the top-level README §5a (`install.sh`, `systemd/`, `apply`/`export`) with a real reboot. The VM must already exist (`l2-vbox.sh` creates it). Same `VT_RELEASE` / `VM` / `VT_SSH_PORT` selection as `l2-vbox.sh`; anything other than `test` (default) or `cleanup` prints `usage: … [test|cleanup]` and exits 1.
+
+A `test` run `rsync`s the tree to `~ubuntu/work/`, writes `commit.txt` and `timer-health.txt`, then runs the steps of `testbed/vbox/systemd-test.sh` as root in the VM:
+
+| Step | What it checks |
+|---|---|
+| `pre` | `make build`; a test N6 that exists at every boot (systemd-networkd veth `vn6` ↔ `vn6p`, `10.99.1.0/24`, `RequiredForOnline=no`); `install.sh install --enable` twice (config kept, edited env kept); env `IFACE=vn6`, two policies (one killswitch); `systemctl start vantage-5g-monitor` brings up both units; attached |
+| reboot | `sudo systemctl reboot` from the host; the boot id must change, otherwise `post` is not run |
+| `post` | after boot: both units active, attached, policies restored from `policies.conf`, monitor on `127.0.0.1:9090` only; real UL/DL traffic from netns `ue` and killswitch drops; reload (changed UE, CLI-only UE removed, attach kept); stop (detached, unloaded, monitor keeps running and drops its series), start, restart (monitor PID unchanged, re-reads the new maps); `IFACE` edited while running (stop detaches the recorded interface); late interface (wait loop); failures: interface never appears (status 6), empty `XDP_MODE=` (status 1, nothing loaded), invalid `policies.conf` (nothing attached), `setup.sh` refusal on an `ingress` qdisc (status 3, other qdisc untouched); `IFACE_WAIT_SEC=600` clamped; empty `policies.conf` reload refused; reload waits for the writer lock; bpffs unmounted before start (the hardened unit mounts it in the host namespace) and the monitor reading maps with `CAP_BPF CAP_DAC_OVERRIDE` under `kernel.unprivileged_bpf_disabled=2`; unload gate (a Vantage XDP left on `vx0`: stop fails, pins kept, CLI works, `uninstall` exits 4 and removes nothing); quoted `MONITOR_ARGS="--bind 127.0.0.1 --port 9091"` |
+| `cleanup` | runs always, also after a FAIL: `uninstall` while running (stopped, detached, files removed, `/etc/vantage-5g` kept), `uninstall --purge` re-run, no unit files, test interface and networkd files removed |
+
+Each check prints `PASS …` / `FAIL …`; each step ends with `RESULT-<step> pass=N fail=M`. Results go to `_workspace/l2sd-<release>-<YYYYmmdd_HHMMSS>/` (`pre.log`, `post.log`, `cleanup.log`, `summary.txt`, `timer-health.txt`, `commit.txt`). Exit 0 only if all three steps printed `fail=0` and the reboot happened. The throughput lines in `post.log` are informational (functional test); with a DEGRADED `timer-health.txt` they come out low (§10).
+
+The test changes the VM system-wide (`/usr/local`, `/etc/systemd`, `/etc/vantage-5g`, networkd files); `cleanup` removes all of it. Do not run it at the same time as `l2-vbox.sh` or `l3-vbox.sh` on the same VM.
 
 ## 6. Environment variables
 
@@ -280,6 +304,7 @@ python3 .claude/skills/vantage-testbed/scripts/counter_verdict.py $d/spec.csv $d
 
 - **No `sch_fq` in Docker Desktop's kernel (L1).** EDT pacing needs a root `fq` qdisc, so `setup.sh` cannot run and downlink pacing is untestable; `run-tests.sh` detects this (`has_fq=0` in `env.txt`) and attaches without fq. Use L2.
 - **Throughput depends on the host.** Both levels run iperf3 on the same machine as the datapath. A busy host (other VMs, builds) makes sessions fall **under** their caps; counter and iperf verdicts then fail although the datapath is fine. Check host load before trusting an under-cap result (`uptime`; on macOS also the VM's `VBoxHeadless` CPU in Activity Monitor). Over-cap results are not caused by load.
+  On macOS, VirtualBox runs the VMs in NEM "turtle" mode (no kernel driver; `VBox.log`: `NEM: Turtle execution mode is active`). Under contention, for example two VMs running at once, a VM can get into a state where `VBoxHeadless` uses more than 100% CPU while the guest is idle. In that state guest timer wake-ups arrive tens of ms late, and every shaper under-delivers by 15–50%: Vantage, `fq maxrate`, `tc police`. This hit both releases (X10). `l2-vbox.sh` therefore runs a preflight and writes `timer-health.txt` into the result directory; the last line reads `timer-health OK|DEGRADED p50/p99/max`, and DEGRADED is also printed. If it reports DEGRADED: power off the other VMs (`VBoxManage list runningvms`), reboot this one (`sudo systemctl reboot` inside it), and re-run. Run one L2 VM at a time. Do not add `idle=poll`. It fixed noble's kernel shapers but made jammy's `fq maxrate` collapse to about 1 packet per jiffy (2.9 of 20 Mbps), and it costs ~350% host CPU per VM.
 - **Emulated N6 only.** veth pairs, no GTP and no real UPF. `VT_XDP_MODE=native` exercises the veth driver's native XDP and `VT_N6_TXQ` gives veth software TX queues (so the `mq` + per-queue `fq` layout and cross-queue pacing are tested), but a physical NIC driver's native XDP support, its hardware queues and IRQ/XPS mapping, BIG TCP / GRO sizes and the core's NAT behaviour are only checked on the physical server (runbook §6).
 - **L3: locally generated TCP on the virtio N6 NIC under-delivers with any shaper.** With iperf3 servers on vantage-svc itself (as README §8 does), a single TCP DL flow paced to a few Mbps reached about 50–85% of the cap in our runs, and the kernel's `fq maxrate` and `tbf` on the same NIC do the same or worse; UDP DL and TCP forwarded through vantage-svc (likely cause: TCP small-queue back-pressure waits for the VM NIC's TX completions; not seen on L2's veth) reach the cap through the same pacer. `b-dl-udp-pacer-control` and `b-dl-kernel-fq-control` record this in every run. The four-session run usually lands within tolerance; a DL row a few percent under is environment when those controls agree. UERANSIM's userspace GTP-U limits the path to tens of Mbps per session under load, hence the small caps.
 - **`unload` guard is per network namespace.** Attachments inside the UE/core namespaces would not be seen; the tests attach only in the service-node namespace.
@@ -299,7 +324,7 @@ python3 .claude/skills/vantage-testbed/scripts/counter_verdict.py $d/spec.csv $d
 
 **`[FAIL] build`** — read `build.log`. Every later step is skipped (`[SKIP] rest build failed`).
 
-**All throughput rows under cap on one release only** — compare with the other release on the same host and with the kernel-shaper check in §9 before treating it as a defect.
+**All throughput rows under cap on one release only** — read `timer-health.txt` in the result directory first (DEGRADED = environment, see §10), then compare with the other release on the same host and with the kernel-shaper check in §9 before treating it as a defect.
 
 ## 12. Files
 
@@ -312,6 +337,8 @@ python3 .claude/skills/vantage-testbed/scripts/counter_verdict.py $d/spec.csv $d
 | `vbox/vm-lib.sh` | VirtualBox helpers shared by `l2-vbox.sh` and `l3-vbox.sh` (create VM from the cloud image, wait for SSH/cloud-init, power off, delete) |
 | `vbox/core-user-data.tmpl`, `vbox/core-provision.sh`, `vbox/core-ran.sh` | L3 core VM: cloud-init, Open5GS/MongoDB/UERANSIM provisioning, RAN netns and quickstart NAT state |
 | `vbox/l3-test.sh` | Body of `l3-vbox.sh test` |
+| `l2-systemd.sh` | L2 systemd service test with a reboot: `test` / `cleanup` (§5b) |
+| `vbox/systemd-test.sh` | Body of `l2-systemd.sh`: `pre` / `post` / `cleanup`, run as root in the VM |
 | `run-tests.sh` | Test body shared by L1 and L2 (§8) |
 | `netns-topo.sh` | Emulated UE / core / N6 topology (§7) |
 | `docker/Dockerfile` | `vantage-dev` image: Ubuntu 24.04, clang/llvm/libbpf, linux-tools, iproute2, iptables, iperf3, tcpdump, Rust (rustfmt, clippy) |

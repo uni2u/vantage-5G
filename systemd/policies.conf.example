@@ -1,0 +1,21 @@
+# /etc/vantage-5g/policies.conf -- per-UE policies applied by vantage-5g.service
+# at every start and `systemctl reload vantage-5g` (vantage-5G apply --replace:
+# UEs not listed here lose their policy).
+#
+#   <UE_IPv4>  <rx_mbps>  <tx_mbps>
+#
+# rx = UL (UE -> N6, XDP policer), tx = DL (N6 -> UE, EDT pacer), integer Mbps
+# 0..400000. rx_mbps=0: UL uncapped; tx_mbps=0: DL blocked (killswitch).
+# `#` starts a comment; blank lines are ignored; a UE may appear only once.
+# The whole file is checked first: one bad line = nothing is applied.
+# A file with no policies does not clear existing ones: reload then fails
+# (apply --replace refuses without --allow-empty) and the current policies
+# stay. At boot the maps are new and empty, so an empty file just means
+# "no policies". To really clear all policies of a running service:
+#   sudo vantage-5G apply -f /etc/vantage-5g/policies.conf --replace --allow-empty
+#
+# Save the current (CLI-made) policies into this file:
+#   sudo vantage-5G export > /tmp/policies.conf && sudo mv /tmp/policies.conf /etc/vantage-5g/policies.conf
+#
+# 10.45.1.23   10   20
+# 10.45.1.24    0    0    # DL blocked

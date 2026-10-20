@@ -2,6 +2,8 @@
 name = "vantage-5G"
 version = "0.2.0"
 edition = "2021"
+# std File::try_lock (writer lock, Q8-2) is stable since 1.89.
+rust-version = "1.89"
 
 [dependencies]
 anyhow = "1.0"

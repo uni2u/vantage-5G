@@ -32,6 +32,32 @@ vm_running() { VBoxManage showvminfo "${VM}" --machinereadable 2>/dev/null | gre
 vm_start()   { vm_running || VBoxManage startvm "${VM}" --type headless >/dev/null; }
 vssh()       { ssh "${SSH_OPTS[@]}" ubuntu@127.0.0.1 "$@"; }
 
+# vm_timer_health — print host state and the guest's timer wake-up latency (300 x 10 ms sleeps).
+# VirtualBox on macOS runs these guests in NEM "turtle" mode (driverless; see VBox.log). When the
+# host is contended (several VMs running, multipassd, builds) the VM's VBoxHeadless burns >100% CPU
+# even with an idle guest and timer wake-ups arrive tens of ms late; every shaper in the guest
+# (Vantage EDT/XDP, kernel fq maxrate, tc police) then under-delivers (X10). Healthy: p99 about
+# 11-15 ms, VBoxHeadless idle under ~15%. Last line: "timer-health OK|DEGRADED p50 … p99 … max …".
+# Informational only: it does not change or skip any test.
+vm_timer_health() {
+    echo "host: $(uptime)"
+    echo "running VMs:"; VBoxManage list runningvms 2>/dev/null | sed 's/^/  /'
+    echo "VBoxHeadless CPU (ps, decayed average):"
+    ps -Ao pcpu=,args= | awk '/VBoxHeadless --comment/ && !/awk/ {print "  " $1 "%  " $4}'
+    vssh "python3 -" <<'PY'
+import time
+g = []
+last = time.monotonic()
+for _ in range(300):
+    time.sleep(0.01)
+    n = time.monotonic(); g.append((n - last) * 1000); last = n
+g.sort()
+p50, p99, mx = g[150], g[296], g[-1]
+print("timer-health %s p50 %.1f ms p99 %.1f ms max %.1f ms (sleep 10 ms x300)"
+      % ("OK" if p99 <= 25 else "DEGRADED", p50, p99, mx))
+PY
+}
+
 create_vm() {
     mkdir -p "${CACHE}/ssh" "${VMDIR}/seed"
     [[ -f "${KEY}" ]] || ssh-keygen -q -t ed25519 -N '' -C vantage-testbed -f "${KEY}"

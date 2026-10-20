@@ -17,6 +17,10 @@ description: "Vantage-5G 로컬 테스트 실행과 물리 서버 설치 준비.
 | L3 | VirtualBox VM 2대: `vantage-core`(jammy, Open5GS 2.8 레퍼런스 설치 + UERANSIM v3.2.7, gNB·UE 2대는 netns `ran`, SSH :2524) + `vantage-svc`(L2 noble VM에 NIC2 추가), N6 = intnet `vantage-n6` 10.200.0.1↔10.200.0.2 | `./testbed/l3-vbox.sh up` → `./testbed/l3-vbox.sh test` (`ssh-core`/`ssh-svc`/`down`/`delete`) | (a) quickstart MASQUERADE면 N6에 UPF IP만 보이고 정책 불일치, (b) README §3.2 (1) A·B안·(2)·(3)·종단 확인을 문서 명령 그대로, §8 4세션(`iperf3 -B <UE IP>`, counter+iperf 판정), killswitch, DL UDP/커널 fq 대조. 결과 `_workspace/l3-<ts>/` | 물리 NIC native XDP·하드웨어 큐, UERANSIM 용량(세션당 수십 Mbps) 이상의 처리량. virtio NIC에서 로컬 TCP DL은 어떤 셰이퍼든 cap 미달(환경, testbed/README §10) |
 | L4 | 물리 서버 | `_workspace/05_install_runbook.md` (사용자 실행) | 실제 NIC·드라이버·실 Core | — |
 
+**타이머 열화(X10)와 단일 VM 원칙:** macOS VirtualBox는 NEM turtle 모드라 경합 시(VM 2대 동시 기동 등) `VBoxHeadless`가 유휴 게스트에서도 100%+ CPU를 쓰고 게스트 타이머가 수십 ms 늦어져 모든 셰이퍼(Vantage, `fq maxrate`, `tc police`)가 15~70% 미달한다. `l2-vbox.sh`·`l2-systemd.sh`는 결과 디렉토리에 `timer-health.txt`(마지막 줄 `timer-health OK|DEGRADED p50/p99/max`)를 남긴다. **L2 VM은 한 번에 하나만 켠다.** DEGRADED면 다른 VM을 끄고 이 VM을 재부팅(필요하면 power off → start)한 뒤 재실행한다. 그래도 DEGRADED면 처리량 행의 미달은 같은 VM의 커널 `fq maxrate` 대조(셰이퍼보다 같거나 더 미달)로 환경으로 분류하고 기능 단계만 판정한다(cap 초과는 열화와 무관하게 제품 결함). `idle=poll`은 쓰지 않는다(jammy fq 붕괴, testbed/README §10).
+
+**systemd 서비스(L2):** `[VT_RELEASE=jammy] ./testbed/l2-systemd.sh` — 본체 `testbed/vbox/systemd-test.sh pre|post|cleanup`(VM에서 root), 사이에 호스트가 VM 재부팅(boot id 변경 확인). install.sh·유닛·apply/export·실패 경로·unload 게이트·uninstall을 검사하고 cleanup은 항상 실행. 결과 `_workspace/l2sd-<release>-<ts>/`(`summary.txt`의 `RESULT-<step> pass=N fail=M`). install.sh/systemd/·apply 관련 변경은 이것을 두 릴리스에서 돌린다. 처리량 줄은 참고용.
+
 빠른 단건 실험: `./testbed/dev.sh '<cmd>'` — 저장소 사본에서 명령 실행(예: `'make build'`, `'bpftool prog loadall vantage_tx_pacer.o /sys/fs/bpf/t type tc'`).
 
 ### 공통 테스트 본체 `testbed/run-tests.sh`
