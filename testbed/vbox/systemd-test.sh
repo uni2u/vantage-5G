@@ -95,7 +95,7 @@ EOF
     "${REPO}/install.sh" install >/dev/null && grep -q 'marker: user edit' /etc/vantage-5g/vantage-5g.env \
         && ok "install keeps edited env" || bad "install overwrote env"
     hdr "start"
-    systemctl start vantage-5g-monitor.service; echo "rc=$?"   # pulls in vantage-5g (Wants=)
+    systemctl start vantage-5g.service vantage-5g-monitor.service; echo "rc=$?"   # monitor has After= only (Q8-11)
     st vantage-5g; st vantage-5g-monitor
     attached && ok "pre-reboot attached" || bad "pre-reboot not attached"
     $B list
@@ -135,9 +135,9 @@ post)
     systemctl stop vantage-5g; echo "stop rc=$?"; st vantage-5g; st vantage-5g-monitor
     ! attached && [[ ! -d /sys/fs/bpf/vantage ]] && ok "stop: detached + unloaded" || bad "stop"
     sleep 2
-    [[ "$(systemctl is-active vantage-5g-monitor)" == active ]] && ok "stop: monitor keeps running (Wants=, O-8b)" || bad "stop: monitor went down"
+    [[ "$(systemctl is-active vantage-5g-monitor)" == active ]] && ok "stop: monitor keeps running (After= only)" || bad "stop: monitor went down"
     [[ -z "$(curl -s 127.0.0.1:9090/metrics | grep '^vantage_ue_policy_')" ]] && ok "stop: monitor dropped series" || bad "stop: stale series"
-    systemctl start vantage-5g-monitor; echo "start rc=$?"
+    systemctl start vantage-5g; echo "start rc=$?"
     attached && [[ "$($B export | grep -vc '^#')" -eq 2 ]] && ok "start: attached + 2 policies" || bad "start"
     MID1=$(systemctl show -p MainPID --value vantage-5g-monitor)
     systemctl restart vantage-5g; echo "restart rc=$?"; sleep 1
@@ -264,6 +264,31 @@ post)
     /usr/local/lib/vantage-5g/detach.sh vx0 >/dev/null; ip link del vx0
     systemctl reset-failed vantage-5g
     systemctl start vantage-5g vantage-5g-monitor && attached && ok "back to running" || bad "restart after gate"
+    hdr "VERIFY-L2-8e: monitor restart does not start a stopped vantage-5g (Q8-11)"
+    systemctl show -p Wants,Requires,After vantage-5g-monitor
+    systemctl show -p Wants,Requires --value vantage-5g-monitor | grep -q 'vantage-5g.service' \
+        && bad "monitor still Wants/Requires vantage-5g" || ok "monitor: After= only (no Wants/Requires on vantage-5g)"
+    systemctl stop vantage-5g
+    systemctl restart vantage-5g-monitor; sleep 3
+    [[ "$(systemctl is-active vantage-5g)" == inactive ]] && ! attached && [[ ! -d /sys/fs/bpf/vantage ]] \
+        && [[ "$(systemctl is-active vantage-5g-monitor)" == active ]] \
+        && ok "main stopped: monitor restart keeps it inactive, nothing loaded/attached" || bad "monitor restart started main"
+    systemctl start vantage-5g
+
+    hdr "VERIFY-L2-8e: MONITOR_ARGS change takes effect with the documented restart (Q8-10)"
+    cp /etc/vantage-5g/vantage-5g.env /tmp/env.keep8e
+    sed -i 's/^MONITOR_ARGS=.*/MONITOR_ARGS=/' /etc/vantage-5g/vantage-5g.env
+    systemctl restart vantage-5g-monitor; sleep 2
+    ss -ltn | grep -q '0.0.0.0:9090' && echo "(setup) monitor on 0.0.0.0:9090 without --bind"
+    sed -i 's/^MONITOR_ARGS=.*/MONITOR_ARGS=--bind 127.0.0.1/' /etc/vantage-5g/vantage-5g.env
+    systemctl restart vantage-5g; sleep 2
+    ss -ltn | grep -q '0.0.0.0:9090' && echo "[i] restart vantage-5g alone leaves the monitor on 0.0.0.0:9090 (why the docs say restart vantage-5g-monitor)"
+    systemctl restart vantage-5g-monitor; sleep 2
+    ss -ltn | grep 9090
+    ss -ltn | grep -q '127.0.0.1:9090' && ! ss -ltn | grep -q '0.0.0.0:9090' && curl -s 127.0.0.1:9090/metrics | grep -q '^vantage_ue_policy_rx_bps' \
+        && ok "after restart vantage-5g-monitor: bind moved 0.0.0.0 -> 127.0.0.1" || bad "MONITOR_ARGS change not applied"
+    cp /tmp/env.keep8e /etc/vantage-5g/vantage-5g.env
+
     hdr "MONITOR_ARGS with quotes (VERIFY-L2-8a): systemd strips them, \$MONITOR_ARGS splits into words"
     cp /etc/vantage-5g/vantage-5g.env /tmp/env.keep
     sed -i 's/^MONITOR_ARGS=.*/MONITOR_ARGS="--bind 127.0.0.1 --port 9091"/' /etc/vantage-5g/vantage-5g.env

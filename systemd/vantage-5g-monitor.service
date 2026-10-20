@@ -1,7 +1,11 @@
 # vantage-5g-monitor.service -- Prometheus exporter (installed by install.sh)
-# Wants=+After= vantage-5g.service: starting the monitor also starts the main
-# unit, but the monitor keeps running when vantage-5g fails to start, is
-# stopped, or fails to stop (the state an operator most wants to see).
+# After= vantage-5g.service only (no Wants=/Requires=): both units start at
+# boot through their own WantedBy=multi-user.target. Starting or restarting the
+# monitor never starts a stopped vantage-5g (no unintended load/attach during
+# maintenance), and the monitor keeps running when vantage-5g fails to start,
+# is stopped, or fails to stop (the state an operator most wants to see).
+# vantage-5g is not restarted with the monitor either: after editing
+# MONITOR_ARGS or upgrading, run `systemctl restart vantage-5g-monitor`.
 # `monitor` re-opens the pins on every scrape (D8): while vantage-5g is down it
 # logs the scrape error once and drops the series; after a restart it re-reads
 # the new maps without being restarted itself.
@@ -9,7 +13,6 @@
 # 127.0.0.1; without --bind the CLI listens on 0.0.0.0, N6 side included).
 [Unit]
 Description=Vantage-5G Prometheus exporter
-Wants=vantage-5g.service
 After=vantage-5g.service
 # Port taken / persistent failure: give up after 10 restarts in 5 min instead
 # of retrying every 5 s forever (`systemctl reset-failed` + start to retry).

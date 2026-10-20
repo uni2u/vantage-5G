@@ -106,9 +106,10 @@ do_install() {
     install -d -m 0755 "${LIB}"
     # Leftovers of an install killed with SIGKILL (the trap could not run).
     rm -f "${LIB}"/.*.new.* "${UNIT_DIR}"/.vantage-5g*.new.* "${ETC}"/.*.new.* 2>/dev/null || true
-    # The binary goes last: if the copy stops part-way, the old binary is
-    # still in place and `load` keeps failing loudly on a map mismatch rather
-    # than a new binary running against old .o files.
+    # The binary goes last. This does not make the set atomic: after an
+    # interrupted install the directory can hold new .o files with the old
+    # binary (a restart's ExecStop unloads the pins, so `load` has nothing to
+    # compare against and would not notice). Re-run install before restarting.
     put "${SRC}/vantage_rx_policer.o"       "${LIB}/vantage_rx_policer.o" 0644
     put "${SRC}/vantage_tx_pacer.o"         "${LIB}/vantage_tx_pacer.o"   0644
     put "${SRC}/setup.sh"                   "${LIB}/setup.sh"             0755
@@ -158,11 +159,14 @@ do_install() {
     if ! grep -qE '^[[:space:]]*MONITOR_ARGS=.*--bind' "${ETC}/vantage-5g.env"; then
         echo "    [!] MONITOR_ARGS in ${ETC}/vantage-5g.env has no --bind: the exporter listens on"
         echo "        0.0.0.0:9090 (N6 side included) and shows every UE's IP/policy/counters."
-        echo "        Use --bind 127.0.0.1 or a management-network address."
+        echo "        Use --bind 127.0.0.1 or a management-network address, then:"
+        echo "        sudo systemctl restart ${MON}"
     fi
-    if is_active "${MAIN}"; then
-        echo "    ${MAIN} is running the previous version; to switch (re-attach, short shaping gap):"
-        echo "      sudo systemctl restart ${MAIN}"
+    if is_active "${MAIN}" || is_active "${MON}"; then
+        echo "    The running units still use the previous version; to switch:"
+        is_active "${MAIN}" && echo "      sudo systemctl restart ${MAIN}    (re-attach, short shaping gap)"
+        is_active "${MON}"  && echo "      sudo systemctl restart ${MON}"
+        echo "    (each unit is restarted on its own; restarting one does not restart the other)"
     else
         echo "    start: sudo systemctl start ${MAIN} ${MON}"
     fi
