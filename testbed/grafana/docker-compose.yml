@@ -1,0 +1,31 @@
+# Local check of dashboards/vantage-5g.json (test asset, not for production).
+#
+#   docker compose -f testbed/grafana/docker-compose.yml up -d
+#   -> Prometheus http://127.0.0.1:19091, Grafana http://127.0.0.1:13000 (admin / vantage)
+#   docker compose -f testbed/grafana/docker-compose.yml down -v
+#
+# Prometheus scrapes the exporter at host.docker.internal:19090
+# (prometheus.yml), e.g. a VirtualBox NAT port-forward 127.0.0.1:19090 -> VM :9090
+# with `vantage-5G monitor --bind 0.0.0.0` in the VM (dashboards/README.md "Local test").
+# The dashboard JSON is mounted read-only from dashboards/ as is.
+name: vantage-grafana-test
+services:
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=1d"]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["127.0.0.1:19091:9090"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: vantage
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./provisioning:/etc/grafana/provisioning:ro
+      - ../../dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["127.0.0.1:13000:3000"]
+    depends_on: [prometheus]
