@@ -13,6 +13,7 @@ The scripts were developed on a macOS (x86_64) host. `l2-vbox.sh` and `l3-vbox.s
 5. [l2-vbox.sh — L2 run in a VirtualBox Ubuntu VM](#5-l2-vboxsh--l2-run-in-a-virtualbox-ubuntu-vm)
 5a. [l3-vbox.sh — L3 run: Open5GS + UERANSIM and a separate service node](#5a-l3-vboxsh--l3-run-open5gs--ueransim-and-a-separate-service-node)
 5b. [l2-systemd.sh — systemd service test on an L2 VM](#5b-l2-systemdsh--systemd-service-test-on-an-l2-vm)
+5c. [l2-lan-rehearsal.sh — paste rehearsal of the LAN install runbook](#5c-l2-lan-rehearsalsh--paste-rehearsal-of-the-lan-install-runbook)
 6. [Environment variables](#6-environment-variables)
 7. [Emulated topology (netns-topo.sh)](#7-emulated-topology-netns-toposh)
 8. [What run-tests.sh does](#8-what-run-testssh-does)
@@ -29,7 +30,7 @@ The scripts were developed on a macOS (x86_64) host. `l2-vbox.sh` and `l3-vbox.s
 | **L1** | Docker (Docker Desktop kernel), privileged Ubuntu 24.04 container | `./testbed/l1-docker.sh` | Build, verifier, `load` (and idempotent re-load), attach, uplink RX policing with two concurrent sessions, killswitch, `set`/`reset` state handling, `unload` guard, `detach.sh` exit codes, upgrade from older pins | `sch_fq` is missing → `setup.sh`, downlink EDT pacing and the non-root / `ingress` checks are skipped |
 | **L2** | VirtualBox VM, stock Ubuntu 24.04 (`noble`, default) or 22.04 (`jammy`) | `./testbed/l2-vbox.sh` / `VT_RELEASE=jammy ./testbed/l2-vbox.sh` | All of L1 plus `setup.sh` (re-runs without a hook gap, re-run under load, non-root user, `ingress` refusal, missing `bpftool`, `--xdp-mode` switching, multi-queue `mq` layout with `VT_N6_TXQ`), downlink pacing, the top-level README §8 four concurrent sessions and a 4-flow-per-UE downlink cap check. `./testbed/l2-systemd.sh`: the systemd service install (top-level README §5a) across a reboot (§5b) | Real 5G path (GTP, UPF NAT), physical NIC and its driver's native XDP / hardware queues |
 | **L3** | Two VirtualBox VMs: `vantage-core` (Ubuntu 22.04, Open5GS reference install + UERANSIM) and `vantage-svc` (the L2 noble VM) joined by an internal-network N6 | `./testbed/l3-vbox.sh up`, then `./testbed/l3-vbox.sh test` | Real UE addresses through a 5G core (GTP-U, UPF, `ogstun`): the quickstart NAT failure mode, top-level README §3.2 (NAT exception A and B, `ip_forward`, return route, end-to-end check) and §8 (four sessions bound with `iperf3 -B <UE IP>`, counter/iperf verdicts), killswitch, on a virtio NIC instead of veth | Physical NIC, native XDP on a real driver, hardware queues, throughput above UERANSIM's userspace GTP capacity |
-| **L4** | Physical Ubuntu server | [`docs/install-runbook.md`](../docs/install-runbook.md) (run by hand) | Real NIC, driver, multi-queue, real core | — |
+| **L4** | Physical Ubuntu server | [`docs/install-runbook-lan.md`](../docs/install-runbook-lan.md) (no core, two laptops; rehearsed by `l2-lan-rehearsal.sh`, §5c) / [`docs/install-runbook.md`](../docs/install-runbook.md) (5G path), run by hand | Real NIC, driver, multi-queue, real core | — |
 
 Pick the lowest level that can show the change: contracts only → L0; BPF or CLI logic → L1; anything touching `setup.sh`, qdiscs or TX pacing → L2 (both releases, since iproute2 differs: 5.15 on 22.04 prints no program names). A level that was not run is not a pass.
 
@@ -180,6 +181,31 @@ A `test` run `rsync`s the tree to `~ubuntu/work/`, writes `commit.txt` and `time
 Each check prints `PASS …` / `FAIL …`; each step ends with `RESULT-<step> pass=N fail=M`. Results go to `_workspace/l2sd-<release>-<YYYYmmdd_HHMMSS>/` (`pre.log`, `post.log`, `cleanup.log`, `summary.txt`, `timer-health.txt`, `commit.txt`). Exit 0 only if all three steps printed `fail=0` and the reboot happened. The throughput lines in `post.log` are informational (functional test); with a DEGRADED `timer-health.txt` they come out low (§10).
 
 The test changes the VM system-wide (`/usr/local`, `/etc/systemd`, `/etc/vantage-5g`, networkd files); `cleanup` removes all of it and ends with `sync`. Power the VM off afterwards with `l2-vbox.sh stop` (guest `sync`, then ACPI), not `VBoxManage controlvm … poweroff`: a hard power-off right after the test once lost the removals and the next boot started the uninstalled units again (final regression B). Do not run it at the same time as `l2-vbox.sh` or `l3-vbox.sh` on the same VM.
+
+## 5c. `l2-lan-rehearsal.sh` — paste rehearsal of the LAN install runbook
+
+```bash
+./testbed/l2-lan-rehearsal.sh                   # jammy VM (vantage-svc-jammy), every block, fresh state
+VT_RELEASE=noble ./testbed/l2-lan-rehearsal.sh  # noble VM (vantage-svc)
+FROM=5.2 ./testbed/l2-lan-rehearsal.sh          # resume at block id 5.2 (VM state kept, no teardown unless it reaches the end)
+UNTIL=4.1 ./testbed/l2-lan-rehearsal.sh         # stop after block 4.1 (no teardown)
+```
+
+Checks that [`docs/install-runbook-lan.md`](../docs/install-runbook-lan.md) works by copy and paste. `vbox/runbook_blocks.py` extracts every ```` ```bash ```` block of the runbook verbatim; each must be preceded by `<!-- rh: id=<id> host=svc|a|b [mode=edit|reboot|measure] -->` and the matching visible host label (extraction fails otherwise, so no runnable block escapes the rehearsal). The blocks run in order, each in a **new** interactive shell fed the block text on stdin (`bash -i < block`): history expansion is on and a command that reads stdin would swallow the following lines, as when pasting into a terminal without bracketed paste.
+
+Topology inside the VM (`vbox/lan-rehearsal.sh topo-up`): the root netns is the service node, `IF=vtlan0` (`192.168.77.10/24`, a systemd-networkd veth whose peer is a port of bridge `vtbr0`, so it exists at every boot like a real NIC). Laptops A and B are netns `nb-a`/`nb-b` with a wired `eth0` on the bridge (`.21`, `.22`) and a "Wi-Fi" `wlan0` carrying the default route to the internet (MASQUERADE through the VM's NAT NIC, DNS via `/etc/netns/*/resolv.conf`), users `lapa`/`lapb`, and an sshd per netns (password login) so the runbook's SSH-driven measurement takes a real SSH path.
+
+| Host | How a block runs |
+|---|---|
+| `svc` | `ssh ubuntu@VM 'bash -i'` (with `SSH_ASKPASS` for the runbook's `ssh-copy-id`) |
+| `a`, `b` | `sudo lan-rehearsal.sh run a\|b` → `ip netns exec nb-a sudo -u lapa -H bash -i` |
+| `mode=edit` | not run (`nano`); `lan-rehearsal.sh fill-vars <host> <commit>` fills the `CHANGE_ME` values with `sed` — the runbook's only manual edit |
+| `mode=reboot` | run, then wait for a new boot id and re-create the laptop netns (`topo-up`) |
+| `mode=measure` | `timer-health` recorded first; throughput is judged only when it says OK (§10) |
+
+A block FAILs when its log has a `FAIL ` line (the runbook's own `vt_ck` checks) or a shell error (`syntax error`, `command not found`, `unbound variable`, `event not found`). A full run (no `FROM`/`UNTIL`) starts with `pre-clean` (leftover Vantage state) and `topo-down` (also removes the runbook's artefacts in `~ubuntu`: clone, `~/vt-l4`, `~/.cargo`, `~/.rustup`, the `vt_l4` key), so the service node starts like a fresh server; it clones `COMMIT` (default: local `HEAD`, must exist on GitHub) from GitHub. At the end it fetches the service node's `~/vt-l4`, runs `topo-down` and `residue` (`RESIDUE-OK/FAIL` lines; `/run/vantage-5g.lock`, the CLI writer lock, is reported as INFO) and powers the VM off with `vm_poweroff`. Results: `_workspace/lanrh-<release>-<ts>/` (`summary.txt` with one `BLOCK` line per block, `NN_<id>.log`, `blocks/`, `svc-vt-l4/`, `timer-health-*.txt`, `topo-*.log`, `residue.txt`, `commit.txt`). Exit 0 only if every block passed and the residue check is clean.
+
+Not covered (L4 only): real laptops (NIC/Wi-Fi coexistence, NetworkManager), a physical switch, sudo password prompts and the terminal's bracketed paste, ufw active (the VM's ufw is inactive, so the runbook's ufw branches do not run), multi-queue NICs and native XDP drivers, Grafana UI. Do not run it at the same time as another test on the same VM, and run one VM at a time (§10).
 
 ## 6. Environment variables
 
@@ -343,6 +369,9 @@ python3 .claude/skills/vantage-testbed/scripts/counter_verdict.py $d/spec.csv $d
 | `vbox/l3-test.sh` | Body of `l3-vbox.sh test` |
 | `l2-systemd.sh` | L2 systemd service test with a reboot: `test` / `cleanup` (§5b) |
 | `vbox/systemd-test.sh` | Body of `l2-systemd.sh`: `pre` / `post` / `cleanup`, run as root in the VM |
+| `l2-lan-rehearsal.sh` | Paste rehearsal of `docs/install-runbook-lan.md` on an L2 VM (§5c) |
+| `vbox/runbook_blocks.py` | Extracts the runbook's `<!-- rh: … -->` blocks verbatim (`index.tsv` + `NN_<id>.sh`) |
+| `vbox/lan-rehearsal.sh` | VM side of §5c: `topo-up` / `topo-down` / `pre-clean` / `run a\|b` / `fill-vars` / `residue` |
 | `run-tests.sh` | Test body shared by L1 and L2 (§8) |
 | `netns-topo.sh` | Emulated UE / core / N6 topology (§7) |
 | `docker/Dockerfile` | `vantage-dev` image: Ubuntu 24.04, clang/llvm/libbpf, linux-tools, iproute2, iptables, iperf3, tcpdump, Rust (rustfmt, clippy) |

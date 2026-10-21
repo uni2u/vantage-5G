@@ -1,5 +1,7 @@
 # L4 설치 런북 — 물리 Ubuntu 서버 (22.04 / 24.04)
 
+> 5G 코어 없이 노트북 2대로 하는 첫 배포는 [`install-runbook-lan.md`](install-runbook-lan.md)를 따른다. 이 문서는 코어(UPF)를 거치는 5G 경로용이다.
+
 - 대상 커밋: `main`의 `61ab576`(PR #7 Grafana 대시보드까지) 이후. 아래 `<COMMIT>`을 실제로 받은 해시로 바꾼다. `setup.sh --xdp-mode`·멀티큐(3.3, 3.3a, 4.4a, 5.2), systemd 서비스(3.6), `apply`/`export`, Grafana 대시보드(3.7.3)가 모두 들어 있다.
 - 로컬 근거(2026-10-21 최종 회귀, 제품 코드 `61ab576`. 실행 중 이 런북만 수정 중이라 일부 `commit.txt`가 `61ab576-dirty`). VirtualBox VM은 한 번에 하나만 켰고(L3는 구조상 2대), 처리량은 VM 타이머 점검(timer-health)이 OK일 때만 판정했다. 물리 서버에는 이 점검이 해당하지 않는다.
   - L1 Docker: `l1-20261021_073924` 26 PASS / 0 FAIL / 8 SKIP(sch_fq 없음 → L2).

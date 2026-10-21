@@ -27,7 +27,7 @@ Metrics are exported to Prometheus for a dashboard.
 13. [Local development & testing](#13-local-development--testing)
 14. [Roadmap](#14-roadmap)
 
-Quick path on a fresh service node: §3.2 (network) → §3.1 (packages) → §4 (`make build`) → §5 (`load`, `setup.sh`) → §6 (`set`) → §8 (measure). To have it come up at every boot instead, install the systemd services after `make build` (§5a). A step-by-step install runbook with expected output and failure actions for every step (Korean) is in [`docs/install-runbook.md`](docs/install-runbook.md).
+Quick path on a fresh service node: §3.2 (network) → §3.1 (packages) → §4 (`make build`) → §5 (`load`, `setup.sh`) → §6 (`set`) → §8 (measure). To have it come up at every boot instead, install the systemd services after `make build` (§5a). Step-by-step install runbooks with expected output and failure actions for every step (Korean): [`docs/install-runbook-lan.md`](docs/install-runbook-lan.md) for a first deployment without a 5G core (service node plus two laptops on the same subnet as UE-A/UE-B, copy-paste only), and [`docs/install-runbook.md`](docs/install-runbook.md) for the 5G path (UPF NAT exception, return route, UERANSIM UEs).
 
 ## 1. What this is
 
@@ -685,7 +685,8 @@ sudo ./target/release/vantage-5G set --ue-ip ... --rx-mbps ... --tx-mbps ...   #
 | `systemd/vantage-5g.service`, `systemd/vantage-5g-monitor.service` | Units installed to `/etc/systemd/system/`: preflight → `load` → `apply --replace` → `setup.sh` at start, `apply --replace` on reload, `detach.sh` → `unload` on stop; the Prometheus exporter (§5a). |
 | `systemd/vantage-5g-unit.sh` | Unit helper (`preflight` / `record` / `detach`), installed to `/usr/local/lib/vantage-5g/`; not for manual use. |
 | `systemd/vantage-5g.env.example`, `systemd/policies.conf.example` | Templates for `/etc/vantage-5g/vantage-5g.env` and `/etc/vantage-5g/policies.conf`. |
-| `docs/install-runbook.md` | Step-by-step install and measurement runbook for a physical Ubuntu server (Korean): command / expected result / on failure for each step. |
+| `docs/install-runbook.md` | Step-by-step install and measurement runbook for a physical Ubuntu server behind a 5G core (Korean): command / expected result / on failure for each step. |
+| `docs/install-runbook-lan.md` | Same for a first deployment without a 5G core: service node plus two laptops on the same subnet as UE-A/UE-B, copy-paste blocks driven by one variable file (Korean). Rehearsed block by block with `testbed/l2-lan-rehearsal.sh`. |
 | `testbed/`             | Local test harness (Docker and VirtualBox VM); see [`testbed/README.md`](testbed/README.md) and §13. |
 | `.claude/`             | Development-agent configuration (agents and skills). Also holds the result-judging scripts used in §8.5: `.claude/skills/vantage-testbed/scripts/iperf_verdict.py`, `counter_verdict.py`. Not needed to build or run Vantage. |
 | `CLAUDE.md`            | Notes for the development agents (Korean). Not needed to build or run Vantage. |
@@ -997,7 +998,7 @@ The repository carries a local test harness so that changes can be checked befor
 | L1 | Docker (privileged Ubuntu 24.04 container) | `./testbed/l1-docker.sh` | Build, verifier, `load`/`unload`, attach, uplink policing, killswitch, `reset`, upgrade paths. No `sch_fq` in Docker Desktop: `setup.sh` and downlink pacing are skipped |
 | L2 | VirtualBox Ubuntu VM (24.04 or 22.04) | `./testbed/l2-vbox.sh`, `VT_RELEASE=jammy ./testbed/l2-vbox.sh` | Everything in L1 plus `setup.sh` (also `--xdp-mode native` and a multi-queue N6 with `VT_N6_TXQ`) and §8's four concurrent sessions on an emulated N6. `./testbed/l2-systemd.sh`: the §5a service install, reload/stop/restart, failure paths and `uninstall`, across a reboot |
 | L3 | Open5GS + UERANSIM VM and the L2 service VM | `./testbed/l3-vbox.sh up`, `./testbed/l3-vbox.sh test` | Real UE addresses through a 5G core: the quickstart NAT failure, §3.2 (1) both methods, (2) with a `FORWARD ACCEPT` policy, (3) with `ip route add`, the end-to-end check, §8 with `iperf3 -B <UE IP>`, killswitch. Not exercised: making (1)–(3) persistent (ufw / `iptables-persistent` / netplan) and the `FORWARD DROP` case |
-| L4 | physical server | [`docs/install-runbook.md`](docs/install-runbook.md) | Real NIC, driver and core |
+| L4 | physical server | [`docs/install-runbook-lan.md`](docs/install-runbook-lan.md) (no core, two laptops), [`docs/install-runbook.md`](docs/install-runbook.md) (5G path) | Real NIC, driver and core. `./testbed/l2-lan-rehearsal.sh` runs every block of the LAN runbook unchanged in an L2 VM first |
 
 One-off commands in the dev container: `./testbed/dev.sh 'make build'`.
 
