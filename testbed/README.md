@@ -13,6 +13,7 @@ The scripts were developed on a macOS (x86_64) host. `l2-vbox.sh` and `l3-vbox.s
 5. [l2-vbox.sh — L2 run in a VirtualBox Ubuntu VM](#5-l2-vboxsh--l2-run-in-a-virtualbox-ubuntu-vm)
 5a. [l3-vbox.sh — L3 run: Open5GS + UERANSIM and a separate service node](#5a-l3-vboxsh--l3-run-open5gs--ueransim-and-a-separate-service-node)
 5b. [l2-systemd.sh — systemd service test on an L2 VM](#5b-l2-systemdsh--systemd-service-test-on-an-l2-vm)
+5c. [runbook-rehearsal.sh — paste rehearsal of the install runbook](#5c-runbook-rehearsalsh--paste-rehearsal-of-the-install-runbook)
 6. [Environment variables](#6-environment-variables)
 7. [Emulated topology (netns-topo.sh)](#7-emulated-topology-netns-toposh)
 8. [What run-tests.sh does](#8-what-run-testssh-does)
@@ -29,7 +30,7 @@ The scripts were developed on a macOS (x86_64) host. `l2-vbox.sh` and `l3-vbox.s
 | **L1** | Docker (Docker Desktop kernel), privileged Ubuntu 24.04 container | `./testbed/l1-docker.sh` | Build, verifier, `load` (and idempotent re-load), attach, uplink RX policing with two concurrent sessions, killswitch, `set`/`reset` state handling, `unload` guard, `detach.sh` exit codes, upgrade from older pins | `sch_fq` is missing → `setup.sh`, downlink EDT pacing and the non-root / `ingress` checks are skipped |
 | **L2** | VirtualBox VM, stock Ubuntu 24.04 (`noble`, default) or 22.04 (`jammy`) | `./testbed/l2-vbox.sh` / `VT_RELEASE=jammy ./testbed/l2-vbox.sh` | All of L1 plus `setup.sh` (re-runs without a hook gap, re-run under load, non-root user, `ingress` refusal, missing `bpftool`, `--xdp-mode` switching, multi-queue `mq` layout with `VT_N6_TXQ`), downlink pacing, the top-level README §8 four concurrent sessions and a 4-flow-per-UE downlink cap check. `./testbed/l2-systemd.sh`: the systemd service install (top-level README §5a) across a reboot (§5b) | Real 5G path (GTP, UPF NAT), physical NIC and its driver's native XDP / hardware queues |
 | **L3** | Two VirtualBox VMs: `vantage-core` (Ubuntu 22.04, Open5GS reference install + UERANSIM) and `vantage-svc` (the L2 noble VM) joined by an internal-network N6 | `./testbed/l3-vbox.sh up`, then `./testbed/l3-vbox.sh test` | Real UE addresses through a 5G core (GTP-U, UPF, `ogstun`): the quickstart NAT failure mode, top-level README §3.2 (NAT exception A and B, `ip_forward`, return route, end-to-end check) and §8 (four sessions bound with `iperf3 -B <UE IP>`, counter/iperf verdicts), killswitch, on a virtio NIC instead of veth | Physical NIC, native XDP on a real driver, hardware queues, throughput above UERANSIM's userspace GTP capacity |
-| **L4** | Physical Ubuntu server | [`docs/install-runbook.md`](../docs/install-runbook.md) (run by hand) | Real NIC, driver, multi-queue, real core | — |
+| **L4** | Physical Ubuntu server | [`docs/install-runbook.md`](../docs/install-runbook.md) (run by hand; every block rehearsed by `runbook-rehearsal.sh`, §5c) | Real NIC, driver, multi-queue, real core | — |
 
 Pick the lowest level that can show the change: contracts only → L0; BPF or CLI logic → L1; anything touching `setup.sh`, qdiscs or TX pacing → L2 (both releases, since iproute2 differs: 5.15 on 22.04 prints no program names). A level that was not run is not a pass.
 
@@ -129,7 +130,7 @@ Topology (mirrors the target deployment: the UPF host and the service node are d
 - **vantage-svc**: the L2 noble VM. `up` powers it off once to add NIC2 (`vantage-n6`, MAC `08:00:27:a0:6e:02`) with `VBoxManage modifyvm`, then writes `/etc/netplan/60-vantage-n6.yaml` (10.200.0.2/24, matched by MAC). L2 ignores this NIC; the return route `10.45.0.0/16 via 10.200.0.1` exists only during an L3 test (L2's `netns-topo.sh` uses the same prefix on `vt-n6`).
 - RAN: `core-ran.sh up` (creates netns `ran`, restarts `open5gs-amfd`/`open5gs-upfd`/`open5gs-smfd`, starts `nr-gnb` and `nr-ue` as transient systemd units `vt-gnb`/`vt-ue`; logs with `journalctl -u vt-gnb -u vt-ue`). `test` runs it again if the two `uesimtunN` are missing (e.g. after a reboot of vantage-core).
 
-`test` steps (`summary.txt`, one `.log` per step; the commands are the documented ones from the top-level README and `docs/install-runbook.md` chapters 1 and 4):
+`test` steps (`summary.txt`, one `.log` per step; the commands are the documented ones from the top-level README and the former `docs/install-runbook.md` 5G chapters, now its §2 and appendix A):
 
 | Step | What |
 |---|---|
@@ -180,6 +181,30 @@ A `test` run `rsync`s the tree to `~ubuntu/work/`, writes `commit.txt` and `time
 Each check prints `PASS …` / `FAIL …`; each step ends with `RESULT-<step> pass=N fail=M`. Results go to `_workspace/l2sd-<release>-<YYYYmmdd_HHMMSS>/` (`pre.log`, `post.log`, `cleanup.log`, `summary.txt`, `timer-health.txt`, `commit.txt`). Exit 0 only if all three steps printed `fail=0` and the reboot happened. The throughput lines in `post.log` are informational (functional test); with a DEGRADED `timer-health.txt` they come out low (§10).
 
 The test changes the VM system-wide (`/usr/local`, `/etc/systemd`, `/etc/vantage-5g`, networkd files); `cleanup` removes all of it and ends with `sync`. Power the VM off afterwards with `l2-vbox.sh stop` (guest `sync`, then ACPI), not `VBoxManage controlvm … poweroff`: a hard power-off right after the test once lost the removals and the next boot started the uninstalled units again (final regression B). Do not run it at the same time as `l2-vbox.sh` or `l3-vbox.sh` on the same VM.
+
+## 5c. `runbook-rehearsal.sh` — paste rehearsal of the install runbook
+
+```bash
+VT_REH=lan ./testbed/runbook-rehearsal.sh   # no core: L2 VM (VT_RELEASE=jammy default, or noble)
+VT_REH=l3  ./testbed/runbook-rehearsal.sh   # behind Open5GS + UERANSIM: vantage-core + vantage-svc (needs ./testbed/l3-vbox.sh up once)
+FROM=5.2 VT_REH=l3 ./testbed/runbook-rehearsal.sh   # resume at block id 5.2 (no reset; teardown only if it reaches the end)
+UNTIL=2.7 VT_REH=l3 ./testbed/runbook-rehearsal.sh  # stop after block 2.7 (no teardown)
+```
+
+Checks that [`docs/install-runbook.md`](../docs/install-runbook.md) works by copy and paste, in both setups it covers, with **the same block text** — only the values written into the runbook's variable file differ. `vbox/runbook_blocks.py` extracts every ```` ```bash ```` block verbatim; each must be preceded by `<!-- rh: id=<id> host=svc|a|b|upf [mode=edit|reboot|measure|manual] -->` and the matching visible host label (`[서비스 노드]`, `[클라이언트 A]`, `[클라이언트 B]`, `[UPF 호스트]`), otherwise extraction fails (no runnable block escapes the rehearsal). Each block runs in a **new** interactive shell fed the block text on stdin (`bash -i < block`): history expansion is on and a command that reads stdin would swallow the following lines, as when pasting into a terminal without bracketed paste.
+
+| Host | `VT_REH=lan` (one VM, `vbox/rehearsal-vm.sh lan-up`) | `VT_REH=l3` (`vantage-core` + `vantage-svc`) |
+|---|---|---|
+| `svc` | `ssh ubuntu@VM 'bash -i'`; `IF=vtlan0` (192.168.77.10/24, a systemd-networkd veth on bridge `vtbr0`, exists at every boot) | `ssh ubuntu@vantage-svc 'bash -i'`; `IF` = the N6 NIC (10.200.0.2/24, netplan) |
+| `a`, `b` | netns `nb-a`/`nb-b`, users `lapa`/`lapb`: wired `eth0` on the bridge (.21/.22) + "Wi-Fi" `wlan0` with the default route (NAT, DNS), sshd per netns | both on `vantage-core` netns `ran` (UERANSIM `uesimtun0/1`), user `ueuser`, sshd on 10.100.0.2 (`CLIENT_x_HOST`), default route + NAT for apt; `vantage-svc` gets a wrapper route 10.100.0.0/24 via 10.200.0.1 (management path) |
+| `upf` | not applicable (`UE_GW` empty): listed as `NOT-APPL` | `ssh ubuntu@vantage-core 'bash -i'` (appendix A) |
+| Variable values | `UE_GW`/`UE_NET` empty, caps 10/20/3/5 | `UE_NET=10.45.0.0/16`, `UE_GW=10.200.0.1`, UE addresses read from `core-ran.sh ues`, caps 4/6/2/3 (UERANSIM capacity) |
+
+Modes: `edit` (`nano`) is replaced by `rehearsal-vm.sh fill` (the runbook's only manual edit); `manual` blocks (appendix B, needs an older version's pins) are skipped; `reboot` reboots the service VM for real, waits for a new boot id and re-creates the wrapper state (client netns / management route); `measure` records timer-health of the VM(s) first (throughput is judged only when it says OK, §10). In `l3`, the wrapper runs block 2.4 first as a **negative control** against the Open5GS quickstart MASQUERADE (it must FAIL), then all `[UPF 호스트]` blocks, then 2.4 for real; before client and measure blocks it checks the RAN (both UEs ping the UPF gateway) and re-establishes it once if a UE was lost (logged as `WRAPPER`). A block FAILs on a `FAIL ` line (the runbook's own `vt_ck` checks) or a shell error (`syntax error`, `command not found`, `unbound variable`, `event not found`).
+
+A run without `FROM` starts from a fresh state: Vantage leftovers removed (`pre-clean`), the runbook's artefacts in `~ubuntu` removed (`home-reset`: clone, `~/vt-l4`, `~/.cargo`, `~/.rustup`, the `vt_l4` key, a UE-route netplan drop-in), and in `l3` the core back to the quickstart NAT state (`core-reset`: appendix A rules, `iptables-persistent`, `/etc/iptables`, `90-ue-forward.conf` removed; `core-ran.sh nat-reference`). The runbook clones `COMMIT` (default: local `HEAD`, must exist on GitHub). At the end it fetches `~/vt-l4` of the service node (and the UPF host), tears the wrapper state down, runs the residue check (`RESIDUE-OK/FAIL`; `/run/vantage-5g.lock`, the CLI writer lock, is INFO) and powers the VM(s) off with `vm_poweroff`. Results: `_workspace/rh-<lan-release|l3>-<ts>/` (`summary.txt` with one `BLOCK` line per block, `NN_<id>.log`, `blocks/`, `svc-vt-l4/`, `upf-vt-l4/`, `timer-health-*.txt`, `setup-*.log`, `vars-filled.txt`, `ran-check.log`, `residue.txt`, `commit.txt`). Exit 0 only if every block passed and the residue check is clean.
+
+Not covered (L4 only): real laptops (NIC/Wi-Fi coexistence, NetworkManager), a physical switch, a real UERANSIM host reached over a management network, sudo password prompts and the terminal's bracketed paste, ufw active (the VMs' ufw is inactive), multi-queue NICs and native XDP drivers, Grafana UI. In `l3` both VMs run at once (structurally), so throughput is for reference. Do not run it at the same time as another test on the same VMs.
 
 ## 6. Environment variables
 
@@ -343,6 +368,9 @@ python3 .claude/skills/vantage-testbed/scripts/counter_verdict.py $d/spec.csv $d
 | `vbox/l3-test.sh` | Body of `l3-vbox.sh test` |
 | `l2-systemd.sh` | L2 systemd service test with a reboot: `test` / `cleanup` (§5b) |
 | `vbox/systemd-test.sh` | Body of `l2-systemd.sh`: `pre` / `post` / `cleanup`, run as root in the VM |
+| `runbook-rehearsal.sh` | Paste rehearsal of `docs/install-runbook.md`: `VT_REH=lan` (L2 VM) / `VT_REH=l3` (L3 VMs) (§5c) |
+| `vbox/runbook_blocks.py` | Extracts the runbook's `<!-- rh: … -->` blocks verbatim (`index.tsv` + `NN_<id>.sh`) |
+| `vbox/rehearsal-vm.sh` | VM side of §5c: `lan-up`/`lan-down`, `l3-client-up`/`-down`, `ran-check`, `core-reset`, `svc-mgmt-up`/`-down`, `pre-clean`, `home-reset`, `run <netns> <user>`, `fill`, `residue` |
 | `run-tests.sh` | Test body shared by L1 and L2 (§8) |
 | `netns-topo.sh` | Emulated UE / core / N6 topology (§7) |
 | `docker/Dockerfile` | `vantage-dev` image: Ubuntu 24.04, clang/llvm/libbpf, linux-tools, iproute2, iptables, iperf3, tcpdump, Rust (rustfmt, clippy) |
