@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-runbook_blocks.py -- extract the paste blocks of docs/install-runbook-lan.md for the rehearsal.
+runbook_blocks.py -- extract the paste blocks of docs/install-runbook.md for the rehearsal.
 
 A paste block is a ```bash fence preceded by
-    <!-- rh: id=<id> host=svc|a|b [mode=edit|reboot|measure] -->
-    **[서비스 노드]** | **[노트북 A]** | **[노트북 B]**
+    <!-- rh: id=<id> host=svc|a|b|upf [mode=edit|reboot|measure|manual] -->
+    **[서비스 노드]** | **[클라이언트 A]** | **[클라이언트 B]** | **[UPF 호스트]**
 The visible host label must agree with host=. Every ```bash fence in the document must
 carry such a comment (so no runnable block escapes the rehearsal).
 
@@ -16,7 +16,7 @@ import os
 import re
 import sys
 
-LABEL = {"svc": "[서비스 노드]", "a": "[노트북 A]", "b": "[노트북 B]"}
+LABEL = {"svc": "[서비스 노드]", "a": "[클라이언트 A]", "b": "[클라이언트 B]", "upf": "[UPF 호스트]"}
 src, out = sys.argv[1], sys.argv[2]
 lines = open(src, encoding="utf-8").read().split("\n")
 os.makedirs(out, exist_ok=True)
