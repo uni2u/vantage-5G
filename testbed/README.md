@@ -75,7 +75,7 @@ T=30 ./testbed/l1-docker.sh
 VT_RELEASE=jammy ./testbed/l2-vbox.sh      # jammy (22.04)
 T=20 VT_SETUP_AS=ubuntu ./testbed/l2-vbox.sh
 ./testbed/l2-vbox.sh ssh                   # shell into the VM (starts it if needed)
-./testbed/l2-vbox.sh stop                  # ACPI power-off
+./testbed/l2-vbox.sh stop                  # guest sync, ACPI power-off (hard off after 90 s)
 ./testbed/l2-vbox.sh delete                # power off, unregister, delete disk and VM dir
 ```
 
@@ -143,16 +143,20 @@ Topology (mirrors the target deployment: the UPF host and the service node are d
 | `b3-return-route`, `b-e2e-ue-ip-on-n6` | README §3.2 (3) and "Check end to end": request **and** reply with the UE IP on `<IF>` |
 | `b-baseline-no-policy` | four sessions without policy = capacity of the UERANSIM path; picks the caps (README's 10/20 and 3/5 if every session ≥ 60 Mbps, else 4/6 and 2/3; override `VT_L3_CAPS="A_rx A_tx B_rx B_tx"`) |
 | `set-A`, `set-B`, `iperf-verdict`, `counter-verdict` | README §8.2–8.5: four concurrent `iperf3 -B <UE IP>` sessions (run directory `run/`, `spec.csv`, `stats_t1/t2.txt` at 5 s and 25 s) |
-| `b-stats-has-ue-rows`, `b-no-session-over-cap` | functional checks: both UE addresses counted; no row above cap +10% in either verdict |
-| `b-dl-udp-pacer-control`, `b-dl-kernel-fq-control` | evidence for an under-cap DL: UDP DL at 2× A's cap (counter must be within ±10%), and the kernel's `fq maxrate` on the same NIC (recorded) |
+| `b-stats-has-ue-rows`, `b-no-session-over-cap` | functional checks: both UE addresses counted; no row above cap +10% in either verdict. `b-no-session-over-cap` is `INVALID` (not PASS) when a session carried nothing, since "not above cap" would be vacuous |
+| `b-dl-udp-pacer-control`, `b-dl-kernel-fq-control` | evidence for an under-cap DL: UDP DL at 2× A's cap (counter must be within ±10%), and the kernel's `fq maxrate` on the same NIC (recorded). `INVALID` when iperf3 produced no result |
 | `iperf-verdict-class` (INFO) | written only when `iperf-verdict` failed: "environment" if no row is over cap, `tx_drops` are 0 and the UDP control passed |
 | `killswitch` | `--tx-mbps 0` for UE-B: `(killswitch: DL blocked)`, `ping -I uesimtun1` fails, UE-A pings, `iperf3 -R` for UE-B cannot connect (cap-0 verdict), TX_DROPS rises; restore |
 | `b1-nat-exception-B` | README §3.2 (1) method B (replace the MASQUERADE rule with `! -d <SVC_NET>`): UE IP visible again |
 | `detach`, `unload` | `./detach.sh <IF>`, `vantage-5G unload` |
 
+Result states: `PASS`, `FAIL`, `INVALID`, `INFO`. `INVALID` means the step could not be judged (no iperf3 result, or the RAN lost a UE during it); it is never a PASS and makes `test` exit 1 like a FAIL. `iperf-verdict`/`counter-verdict` are `INVALID` when one of the four sessions has no result or the RAN lost a UE during the run; `killswitch` is `INVALID` when UE-A cannot ping because the RAN lost it (UE-B's block itself still checked).
+
+Timer health and RAN liveness (T-3): `test` records both VMs' guest timer health at start and end (`timer-health-start.txt`, `timer-health-end.txt`, `[INFO] timer-health-*` lines; same measurement as L2, §10). UERANSIM's radio link simulation can drop a UE when the VMs' timers are degraded (gNB log `UE[n] signal lost`). Before the start, the baseline, the 4-session run, the UDP and kernel-fq controls and the killswitch, `test` checks that both PDU sessions still have the addresses read at start and that each UE pings the UPF gateway `10.45.0.1`. If not, it re-establishes the PDU sessions once (`core-ran.sh down` + `up`, NAT untouched) and records `[INFO] ran-lost-<where>` and `ran-reestablished-<where>` (or `ran-reestablish-failed-<where>`; log `ran-reestablish.log`). At start, a failed re-establish ends the run.
+
 Cleanup: an exit trap (normal end, failure, Ctrl-C, ssh drop) kills background captures, runs `detach.sh <IF>` and `unload`, removes the return route and iperf3/tcpdump on vantage-svc, and puts vantage-core back to the quickstart NAT state (`nat-reference-end.log`). `killswitch` restores UE-B's policy even when one of its checks fails. `test` starts both VMs if they are off (e.g. after `down`). `VT_L3_FORCE_KS_FAIL=1` makes the killswitch step fail on purpose (harness self-test).
 
-Result directory `_workspace/l3-<ts>/`: `summary.txt`, `env.txt` (versions, addresses, host `uptime`), `commit.txt`, per-step logs, `*.tcpdump.txt`/`*.ue.txt` captures, `baseline/` and `run/` (iperf3 JSON, `spec.csv`, `stats_*.txt`, `rates.txt`, `uptime.txt`), `verdict.txt`, `verdict_counters.txt`, `tx_drops.txt`, `ctl_*` control runs.
+Result directory `_workspace/l3-<ts>/`: `summary.txt`, `env.txt` (versions, addresses, host `uptime`), `commit.txt`, per-step logs, `*.tcpdump.txt`/`*.ue.txt` captures, `baseline/` and `run/` (iperf3 JSON, `spec.csv`, `stats_*.txt`, `rates.txt`, `uptime.txt`), `verdict.txt`, `verdict_counters.txt`, `tx_drops.txt`, `ctl_*` control runs, `timer-health-start.txt`/`timer-health-end.txt`, `ran-reestablish.log` (only when a re-establish happened).
 
 ## 5b. `l2-systemd.sh` — systemd service test on an L2 VM
 
@@ -175,7 +179,7 @@ A `test` run `rsync`s the tree to `~ubuntu/work/`, writes `commit.txt` and `time
 
 Each check prints `PASS …` / `FAIL …`; each step ends with `RESULT-<step> pass=N fail=M`. Results go to `_workspace/l2sd-<release>-<YYYYmmdd_HHMMSS>/` (`pre.log`, `post.log`, `cleanup.log`, `summary.txt`, `timer-health.txt`, `commit.txt`). Exit 0 only if all three steps printed `fail=0` and the reboot happened. The throughput lines in `post.log` are informational (functional test); with a DEGRADED `timer-health.txt` they come out low (§10).
 
-The test changes the VM system-wide (`/usr/local`, `/etc/systemd`, `/etc/vantage-5g`, networkd files); `cleanup` removes all of it. Do not run it at the same time as `l2-vbox.sh` or `l3-vbox.sh` on the same VM.
+The test changes the VM system-wide (`/usr/local`, `/etc/systemd`, `/etc/vantage-5g`, networkd files); `cleanup` removes all of it and ends with `sync`. Power the VM off afterwards with `l2-vbox.sh stop` (guest `sync`, then ACPI), not `VBoxManage controlvm … poweroff`: a hard power-off right after the test once lost the removals and the next boot started the uninstalled units again (final regression B). Do not run it at the same time as `l2-vbox.sh` or `l3-vbox.sh` on the same VM.
 
 ## 6. Environment variables
 

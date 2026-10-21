@@ -17,8 +17,23 @@ CLI="${WORK}/target/release/vantage-5G"
 VERDICT=${ROOT}/.claude/skills/vantage-testbed/scripts/iperf_verdict.py
 CVERDICT=${ROOT}/.claude/skills/vantage-testbed/scripts/counter_verdict.py
 rec() { printf '[%-4s] %-28s %s\n' "$1" "$2" "${3:-}" | tee -a "${SUMMARY}"; }
-# run <name> <function>: PASS/FAIL by the function's rc, output in <name>.log
-run() { local name=$1; shift; if "$@" >"${OUT}/${name}.log" 2>&1; then rec PASS "${name}"; return 0; else rec FAIL "${name}" "see ${name}.log"; return 1; fi; }
+# run <name> <function>: PASS/FAIL by the function's rc, output in <name>.log.
+# rc 77 = INVALID: the check could not be judged (no measurement, e.g. an iperf3 session that
+# never ran, or the RAN lost a UE). INVALID is never a PASS and makes `test` exit non-zero.
+INVALID=77
+run() {
+    local name=$1 rc; shift
+    "$@" >"${OUT}/${name}.log" 2>&1; rc=$?
+    case ${rc} in
+        0) rec PASS "${name}" ;;
+        "${INVALID}") rec INVALID "${name}" "not judged: $(grep -h '^INVALID' "${OUT}/${name}.log" | tail -1)" ;;
+        *) rec FAIL "${name}" "see ${name}.log" ;;
+    esac
+    return ${rc}
+}
+# mbps_json <file>: received Mbps of an iperf3 -J result; rc 1 (and nothing printed) when the
+# file has no result (connection failed, aborted session: "error" key, null sums).
+mbps_json() { jq -e '(.end.sum_received // .end.sum).bits_per_second / 1e6' "$1" 2>/dev/null; }
 ran() { croot "ip netns exec ran $*"; }            # command on the UE side (netns ran on vantage-core)
 vcli() { sroot "cd ${WORK} && ./target/release/vantage-5G $*"; }
 
@@ -73,6 +88,37 @@ cap_n6() {
     wait ${p}
     return ${rc}
 }
+
+# ---- T-3: VM timer health (X10) and RAN liveness ----
+# th_rec <tag>: guest timer wake-up latency of both VMs -> timer-health-<tag>.txt + INFO line.
+th_rec() {
+    local f="${OUT}/timer-health-$1.txt"
+    { echo "## vantage-core"; core; vm_timer_health; echo "## vantage-svc"; svc; vm_timer_health; } > "${f}" 2>&1
+    rec INFO "timer-health-$1" "core: $(grep '^timer-health' "${f}" | sed -n 1p | cut -d' ' -f2-8); svc: $(grep '^timer-health' "${f}" | sed -n 2p | cut -d' ' -f2-8)"
+}
+# ran_alive: both PDU sessions present with the addresses read at start, and each UE reaches
+# the UPF's ogstun gateway (UERANSIM RLS can lose a UE when the VMs' timers are degraded).
+UPF_GW=10.45.0.1
+ran_alive() {
+    local ues; ues=$(croot "bash /home/ubuntu/core-ran.sh ues")
+    grep -qx "${TUN_A} ${UE_A}" <<<"${ues}" && grep -qx "${TUN_B} ${UE_B}" <<<"${ues}" || { echo "PDU sessions: ${ues:-none}"; return 1; }
+    ran "ping -I ${TUN_A} -c 2 -W 2 ${UPF_GW}" >/dev/null || { echo "UE-A ${UE_A} cannot reach ${UPF_GW}"; return 1; }
+    ran "ping -I ${TUN_B} -c 2 -W 2 ${UPF_GW}" >/dev/null || { echo "UE-B ${UE_B} cannot reach ${UPF_GW}"; return 1; }
+}
+# ensure_ran <where>: if the RAN is not alive, re-establish the PDU sessions once
+# (core-ran.sh down/up; NAT rules are not touched). rc 1 if still not alive or the UE
+# addresses changed (the policies are keyed by them). Logged as INFO lines.
+ensure_ran() {
+    local why; why=$(ran_alive 2>&1) && return 0
+    rec INFO "ran-lost-$1" "${why}; re-establishing PDU sessions (core-ran.sh down/up)"
+    croot "bash /home/ubuntu/core-ran.sh down; bash /home/ubuntu/core-ran.sh up" >> "${OUT}/ran-reestablish.log" 2>&1
+    if why=$(ran_alive 2>&1); then rec INFO "ran-reestablished-$1" "$(croot "bash /home/ubuntu/core-ran.sh ues" | paste -sd' ')"; return 0; fi
+    rec INFO "ran-reestablish-failed-$1" "${why}"
+    return 1
+}
+
+th_rec start
+ensure_ran start || { rec FAIL ran "UEs not usable after one re-establish: see ran-reestablish.log"; exit 1; }
 
 # ---- 0. UE side: README §8.1 ----
 ue_addrs() {
@@ -196,8 +242,11 @@ baseline() {
     vcli list
     run4 baseline 1000 1000 1000 1000
     rates "${OUT}/baseline" | tee "${OUT}/baseline/rates.txt"
-    awk '$2 > 1 {n++} END {exit !(n == 4)}' "${OUT}/baseline/rates.txt"
+    awk '$2 > 1 {n++} END {exit !(n == 4)}' "${OUT}/baseline/rates.txt" && return 0
+    ran_alive || { echo "INVALID: RAN lost a UE during the baseline"; return ${INVALID}; }
+    return 1
 }
+ensure_ran baseline
 run b-baseline-no-policy baseline
 MIN=$(awk 'NR==1 || $2 < m {m=$2} END {printf "%d", m}' "${OUT}/baseline/rates.txt" 2>/dev/null)
 if [[ -n "${VT_L3_CAPS:-}" ]]; then read -r CA_RX CA_TX CB_RX CB_TX <<<"${VT_L3_CAPS}"
@@ -209,23 +258,40 @@ echo "baseline min session ${MIN} Mbps -> caps A rx/tx ${CA_RX}/${CA_TX}, B rx/t
 run set-A vcli set --ue-ip ${UE_A} --rx-mbps ${CA_RX} --tx-mbps ${CA_TX}
 run set-B vcli set --ue-ip ${UE_B} --rx-mbps ${CB_RX} --tx-mbps ${CB_TX}
 vcli list > "${OUT}/list.txt" 2>&1
+ensure_ran run
 run4 run "${CA_RX}" "${CA_TX}" "${CB_RX}" "${CB_TX}"
 R=${OUT}/run
 rates "${R}" > "${R}/rates.txt"
-python3 "${VERDICT}" "${R}/spec.csv" > "${OUT}/verdict.txt" 2>&1 && rec PASS iperf-verdict || rec FAIL iperf-verdict "see verdict.txt"
-python3 "${CVERDICT}" "${R}/spec.csv" "${R}/stats_t1.txt" "${R}/stats_t2.txt" > "${OUT}/verdict_counters.txt" 2>&1 \
-    && rec PASS counter-verdict || rec FAIL counter-verdict "see verdict_counters.txt"
+# A session without a result (aborted, RAN lost) makes both verdicts unjudgeable for this run.
+RUN_VALID=1; RUN_WHY=""
+for f in a_ul a_dl b_ul b_dl; do mbps_json "${R}/${f}.json" >/dev/null || { RUN_VALID=0; RUN_WHY+="${f} has no iperf3 result; "; }; done
+ran_alive >/dev/null 2>&1 || { RUN_VALID=0; RUN_WHY+="RAN lost a UE during the run; "; }
+python3 "${VERDICT}" "${R}/spec.csv" > "${OUT}/verdict.txt" 2>&1; vrc=$?
+python3 "${CVERDICT}" "${R}/spec.csv" "${R}/stats_t1.txt" "${R}/stats_t2.txt" > "${OUT}/verdict_counters.txt" 2>&1; crc=$?
+if [[ ${RUN_VALID} -eq 1 ]]; then
+    [[ ${vrc} -eq 0 ]] && rec PASS iperf-verdict || rec FAIL iperf-verdict "see verdict.txt"
+    [[ ${crc} -eq 0 ]] && rec PASS counter-verdict || rec FAIL counter-verdict "see verdict_counters.txt"
+else
+    rec INVALID iperf-verdict "not judged: ${RUN_WHY}"
+    rec INVALID counter-verdict "not judged: ${RUN_WHY}"
+fi
 cat "${OUT}/verdict.txt" "${OUT}/verdict_counters.txt"
 # Functional checks independent of the host's load: every UE seen by its own address,
 # and no session above its cap (iperf err% and counter err% <= +10%).
 stats_rows() {
     cat "${R}/stats_after.txt"
-    awk -v a="${UE_A}" -v b="${UE_B}" '$1==a && $2>0 && $5>0 {na=1} $1==b && $2>0 && $5>0 {nb=1} END {exit !(na && nb)}' "${R}/stats_after.txt"
+    awk -v a="${UE_A}" -v b="${UE_B}" '$1==a && $2>0 && $5>0 {na=1} $1==b && $2>0 && $5>0 {nb=1} END {exit !(na && nb)}' "${R}/stats_after.txt" && return 0
+    [[ ${RUN_VALID} -eq 1 ]] || { echo "INVALID: ${RUN_WHY}"; return ${INVALID}; }
+    return 1
 }
 run b-stats-has-ue-rows stats_rows
 no_over_cap() {
     awk '$1 ~ /^[AB]-(UL|DL)$/ && $7+0 > 10 {print "over cap (iperf): " $0; bad=1} END {exit bad}' "${OUT}/verdict.txt" || return 1
     awk '$1 ~ /^[AB]-(UL|DL)$/ && $6+0 > 10 {print "over cap (counter): " $0; bad=1} END {exit bad}' "${OUT}/verdict_counters.txt" || return 1
+    # "not above cap" is vacuous for a session that carried nothing: all 4 rows must have data.
+    [[ ${RUN_VALID} -eq 1 ]] || { echo "INVALID: no over-cap seen, but ${RUN_WHY}"; return ${INVALID}; }
+    [[ $(awk '$1 ~ /^[AB]-(UL|DL)$/ && $6 != "-"' "${OUT}/verdict_counters.txt" | wc -l) -eq 4 ]] \
+        || { echo "INVALID: a session has no counters"; return ${INVALID}; }
     echo "no session above cap +10%"
 }
 run b-no-session-over-cap no_over_cap
@@ -240,12 +306,15 @@ ctl_dl() {
     local sp=$!
     ran "iperf3 -c ${SVC} -B ${UE_A} -p 5203 -t 16 -R -J $*" > "${OUT}/${name}.json"; wait ${sp}
     ssh_s "cat /tmp/c1 /tmp/c2" > "${OUT}/${name}_stats.txt"
-    jq -r '(.end.sum_received // .end.sum).bits_per_second/1e6 | "iperf \(.) Mbps"' "${OUT}/${name}.json"
+    local m; m=$(mbps_json "${OUT}/${name}.json") || { echo "INVALID: ${name}: iperf3 produced no result ($(jq -r '.error // "no json"' "${OUT}/${name}.json" 2>/dev/null))"; return ${INVALID}; }
+    echo "iperf ${m} Mbps"
     awk -v ip="${UE_A}" '/^t=/{sub("t=","");t[++n]=$0} $1==ip{b[n]=$5;d[n]=$7} END{if (n==2) printf "counter %.3f Mbps tx_drops +%d\n",(b[2]-b[1])*8/(t[2]-t[1])/1e6,d[2]-d[1]}' "${OUT}/${name}_stats.txt"
 }
 # UDP (no TSQ back-pressure from TX completions): the pacer alone, counter within ±10% of A's tx cap.
 udp_ctl() {
-    local out; out=$(ctl_dl ctl_udp_dl -u -b $(( CA_TX * 2 ))M); echo "${out}"
+    ensure_ran udp-ctl
+    local out; out=$(ctl_dl ctl_udp_dl -u -b $(( CA_TX * 2 ))M) || { echo "${out}"; return ${INVALID}; }
+    echo "${out}"
     echo "${out}" | awk -v c="${CA_TX}" '/^counter/ {r=$2} END {d=(r-c)/c; printf "err %+.1f%%\n", d*100; exit !(d >= -0.10 && d <= 0.10)}'
 }
 run b-dl-udp-pacer-control udp_ctl
@@ -254,11 +323,15 @@ kfq_ctl() {
     vcli reset --ue-ip ${UE_A}
     sroot "tc qdisc replace dev ${IF} root fq maxrate ${CA_TX}mbit"
     ran "iperf3 -c ${SVC} -B ${UE_A} -p 5203 -t 12 -R -J" > "${OUT}/ctl_kfq_dl.json"
-    jq -r '.end.sum_received.bits_per_second/1e6 | "kernel fq maxrate '"${CA_TX}"'mbit: TCP DL \(.) Mbps"' "${OUT}/ctl_kfq_dl.json"
+    local m rc=0
+    if m=$(mbps_json "${OUT}/ctl_kfq_dl.json"); then echo "kernel fq maxrate ${CA_TX}mbit: TCP DL ${m} Mbps"
+    else echo "INVALID: kernel fq control: iperf3 produced no result ($(jq -r '.error // "no json"' "${OUT}/ctl_kfq_dl.json" 2>/dev/null))"; rc=${INVALID}; fi
     # `replace root fq` would keep maxrate: delete and let setup.sh rebuild (supported re-run).
     sroot "tc qdisc del dev ${IF} root; cd ${WORK} && ./setup.sh ${IF} >/dev/null && tc qdisc show dev ${IF} | head -1" || return 1
-    vcli set --ue-ip ${UE_A} --rx-mbps ${CA_RX} --tx-mbps ${CA_TX}
+    vcli set --ue-ip ${UE_A} --rx-mbps ${CA_RX} --tx-mbps ${CA_TX} || return 1
+    return ${rc}
 }
+ensure_ran kfq-ctl
 run b-dl-kernel-fq-control kfq_ctl
 # Classification of the 4-session iperf verdict (E1'): under cap only, tx_drops 0, pacer exact on UDP.
 if grep -q '^\[FAIL\] iperf-verdict' "${SUMMARY}"; then
@@ -279,7 +352,8 @@ killswitch_body() {
     local d1 d2
     d1=$(vcli stats | awk -v b="${UE_B}" '$1==b {print $7}')
     if ran "ping -I ${TUN_B} -c 3 -W 1 ${SVC}"; then echo "UE-B ping succeeded under killswitch"; return 1; fi
-    ran "ping -I ${TUN_A} -c 3 -W 1 ${SVC}" || { echo "UE-A ping failed"; return 1; }
+    ran "ping -I ${TUN_A} -c 3 -W 1 ${SVC}" || { ran_alive >/dev/null 2>&1 && { echo "UE-A ping failed"; return 1; }
+        echo "INVALID: UE-A ping failed and the RAN lost a UE (UE-B block itself was confirmed)"; return ${INVALID}; }
     ran "timeout 20 iperf3 -c ${SVC} -B ${UE_B} -p 5204 -t 8 -R -J" > "${OUT}/ks_b_dl.json"
     printf 'label,ue_ip,direction,cap_mbps,json_path\nB-DL-kill,%s,DL,0,ks_b_dl.json\n' "${UE_B}" > "${OUT}/ks_spec.csv"
     python3 "${VERDICT}" "${OUT}/ks_spec.csv" || return 1
@@ -291,9 +365,10 @@ killswitch_body() {
 killswitch() {
     killswitch_body; local rc=$?
     vcli set --ue-ip ${UE_B} --rx-mbps ${CB_RX} --tx-mbps ${CB_TX} || rc=1
-    ran "ping -I ${TUN_B} -c 3 -W 1 ${SVC}" || rc=1
+    ran "ping -I ${TUN_B} -c 3 -W 1 ${SVC}" || { [[ ${rc} -eq ${INVALID} ]] || rc=1; }
     return ${rc}
 }
+ensure_ran killswitch
 run killswitch killswitch
 
 # ---- README §3.2 (1) method B: replace the MASQUERADE rule instead of the exception ----
@@ -315,6 +390,7 @@ sroot "pkill -x iperf3"
 run detach sroot "cd ${WORK} && ./detach.sh ${IF}"
 run unload vcli unload
 
+th_rec end
 git -C "${ROOT}" describe --always --dirty > "${OUT}/commit.txt" 2>/dev/null
 echo "L3 results: ${OUT}"
-! grep -q '^\[FAIL\]' "${SUMMARY}"
+! grep -qE '^\[(FAIL|INVALID)\]' "${SUMMARY}"
