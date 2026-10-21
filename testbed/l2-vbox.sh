@@ -7,7 +7,7 @@
 #   ./testbed/l2-vbox.sh            # create VM on first use, then test
 #   T=30 ./testbed/l2-vbox.sh
 #   ./testbed/l2-vbox.sh ssh        # shell into the VM
-#   ./testbed/l2-vbox.sh stop       # power off
+#   ./testbed/l2-vbox.sh stop       # power off (guest sync, ACPI, hard off after 90 s)
 #   ./testbed/l2-vbox.sh delete     # remove VM and its disk
 #
 # Release (README §3 supports both):
@@ -40,7 +40,7 @@ case "${1:-test}" in
     delete)
         vm_delete; exit 0 ;;
     stop)
-        vm_running && VBoxManage controlvm "${VM}" acpipowerbutton; exit 0 ;;
+        vm_poweroff; exit 0 ;;
     ssh)
         vm_running || VBoxManage startvm "${VM}" --type headless >/dev/null
         wait_ready >/dev/null; exec ssh "${SSH_OPTS[@]}" ubuntu@127.0.0.1 ;;

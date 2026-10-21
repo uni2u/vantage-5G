@@ -24,3 +24,4 @@
 | 2026-10-20 | L3 테스트베드(Open5GS 레퍼런스 + UERANSIM, UPF/서비스 노드 분리) 구현, vantage-testbed 스킬 L3 갱신 | testbed/, skills/vantage-testbed | 로드맵 2번: 물리 서버 전 5G 경로·NAT 절차 로컬 검증 |
 | 2026-10-20 | X10 원인=VirtualBox 타이머 열화(단일 VM 원칙, timer-health 점검), 검증 레벨 서술 갱신(L2 22.04/24.04, L3 구현됨) | CLAUDE.md, testbed/ | X10 조사 결과, 오래된 서술 정정 |
 | 2026-10-20 | 로드맵 3번: apply/export, systemd 유닛, install.sh (부팅 순서 load → apply → setup.sh, 리더 승인) | src/, systemd/, install.sh | 물리 서버 재부팅 후 정책·attach 복원 |
+| 2026-10-21 | VM 종료 시 게스트 sync 후 ACPI, L3 테스트에 INVALID 상태·timer-health·RAN 생존 확인/재수립 추가 | testbed/, skills/vantage-testbed | 최종 회귀에서 하드 poweroff로 cleanup 유실(L3 1차 오염), UERANSIM 무선 끊김이 FAIL·공허한 PASS로 기록됨 |

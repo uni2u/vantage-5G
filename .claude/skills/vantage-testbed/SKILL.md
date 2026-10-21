@@ -69,3 +69,6 @@ L1~L3을 통과한 커밋에 대해서만 작성한다. 각 단계는 `명령 / 
 - UE IP: Open5GS 레퍼런스는 등록 순서대로 10.45.0.2, 10.45.0.3. `uesimtunN`은 `/24`(UERANSIM 기본 tunNetmask)로 보인다.
 - 처리량 미달 분류: `b-dl-udp-pacer-control`(UDP DL counter ±10%)와 `b-dl-kernel-fq-control`(같은 NIC의 커널 fq maxrate)을 근거로 쓴다. 커널 셰이퍼 대조는 `tc qdisc replace … root fq maxrate X` 후 **`replace root fq`로는 maxrate가 남는다** — `tc qdisc del dev <IF> root` 후 `./setup.sh <IF>`로 복구.
 - 수동 조작: `./testbed/l3-vbox.sh ssh-core`에서 `sudo bash ~/core-ran.sh status|ues|up|down|nat-reference`.
+- 판정 상태: `PASS`/`FAIL`/`INVALID`/`INFO`. `INVALID`는 측정 불가다(iperf3 결과 없음, 측정 중 RAN이 UE를 잃음). PASS가 아니며 실패와 같이 rc 1. 측정값 없는 "cap 초과 없음" 같은 공허한 참은 INVALID로 처리된다.
+- 시작·끝에 두 VM의 timer-health를 기록한다(`timer-health-start/end.txt`). baseline·4세션·대조·killswitch 전에 RAN 생존(UE 주소 + `10.45.0.1` ping)을 확인하고, 끊겼으면 `core-ran.sh down/up`으로 1회 재수립한다(`[INFO] ran-lost-*`/`ran-reestablished-*`). UERANSIM RLS는 VM 타이머 열화 시 UE를 잃는다(최종 회귀 B).
+- VM 종료는 `vm_poweroff`(게스트 `sync` → ACPI → 90 s 후 강제). `VBoxManage controlvm … poweroff`로 바로 끄지 않는다(`l2-systemd.sh` 직후 하드 차단으로 uninstall이 유실된 사례).

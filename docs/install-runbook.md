@@ -1,10 +1,13 @@
 # L4 설치 런북 — 물리 Ubuntu 서버 (22.04 / 24.04)
 
-- 대상 커밋: `main`의 `d80ee7b` 이후. 아래 `<COMMIT>`을 실제로 받은 해시로 바꾼다. `d80ee7b`에는 4.2의 판정 스크립트 `counter_verdict.py`가 들어 있다(`311ee1c`에는 없음).
-- 로컬 근거: 로컬 L1/L2 실행은 `ddc00c8` + 미커밋 변경 상태의 작업 트리에서 했다(당시 결과의 `commit.txt`는 HEAD만 기록해 `ddc00c8`로 남아 있다). 그 미커밋 변경이 이후 `311ee1c`로 커밋되었고, `311ee1c`와 `d80ee7b`의 제품 코드(`*.c`, `src/`, `setup.sh`, `detach.sh`, `Makefile`)는 같다(`git diff --stat 311ee1c d80ee7b`). 결과: L1 Docker와 L2 VirtualBox(Ubuntu 22.04)에서 전 단계 PASS. L2 24.04는 기능 단계 전부 PASS, 처리량은 호스트 부하로 판정 보류. 상세 보고서는 개발자 로컬 기록이며 저장소에는 없다.
-- `setup.sh --xdp-mode`와 멀티큐(root `mq` + 큐별 `fq`) 처리(3.3, 3.3a, 4.4a, 5.2)는 브랜치 `feat/setup-mq-xdpmode`의 변경이다. 이 기능이 들어간 커밋을 `<COMMIT>`으로 쓴다. 로컬 근거: L2 VirtualBox(Ubuntu 22.04·24.04)의 veth N6에서 TX 큐 1·2·4개, generic·native 조합으로 확인했다.
-- L3 로컬 테스트베드(`testbed/l3-vbox.sh`: Open5GS 2.8.0 레퍼런스 설치 + UERANSIM v3.2.7 VM과 서비스 노드 Ubuntu 24.04 VM을 별도 N6로 연결)에서 문서 명령 그대로 실행해 확인한 범위: 1.4(방법 A·B, conntrack 삭제), 1.5(FORWARD 정책이 `ACCEPT`인 경우: sysctl.d 파일, `sysctl --system`, `ip route get <SVC>`), 1.6(`ip route add`/`ip route get`), 1.7(종단 확인과 귀환 경로가 없을 때의 진단), 4.0(`uesimtunN` 확인), 4.1(정책 `set`·`list`; D26 같은 값 재적용은 L2에서만), 4.2~4.3(`-B` 바인딩 4세션, stats 스냅샷과 두 판정, 측정 직후 상태), 4.5 killswitch. **확인하지 않은 것**: 1.5의 `-P FORWARD DROP` 분기, 1.5a 영구화(ufw·iptables-persistent), 1.6의 netplan 영구화, 4.4/4.4a(멀티큐), 4.5 D4 — 6장과 함께 L4에서 확인한다.
-- 설치 경로는 두 가지다(README §5, §5a). **(가) 수동**: 3.2 `load` → 3.3 `setup.sh` → 4.1 `set`. 단계마다 출력이 바로 보여 첫 설치·측정·진단에 맞다. 재부팅하면 핀·attach·정책이 모두 사라진다. **(나) systemd 서비스**: 3.6 `install.sh` → `/etc/vantage-5g/` 설정 → `systemctl start`. 부팅마다 load → `apply --replace`(policies.conf) → `setup.sh` 순으로 자동 실행된다. 권장 순서: (가)로 3~5장을 끝까지 한 번 측정한 뒤 3.6으로 (나)를 설치하고, 3.6.5 재부팅 확인 후 필요하면 4장을 서비스 상태에서 다시 측정한다. (나)의 로컬 근거: `testbed/l2-systemd.sh`(L2 VM에서 설치 → 재부팅 → 확인 → 제거, 테스트 N6는 systemd-networkd veth). Ubuntu 24.04(systemd 255)에서 현재 유닛(monitor `Wants=`, 하드닝, `--allow-empty`, 잠금 포함)으로 pre 3/3, post 34/34, cleanup 4/4 PASS. Ubuntu 22.04(systemd 249)는 그 이전 유닛(monitor `Requires=`)으로 pre 3/3, post 26/26, cleanup 4/4 PASS였고 현재 유닛으로는 재검증 예정이다. 두 실행 모두 VM 타이머 열화(X10) 상태라 트래픽 처리량은 기능 확인용이다.
+- 대상 커밋: `main`의 `61ab576`(PR #7 Grafana 대시보드까지) 이후. 아래 `<COMMIT>`을 실제로 받은 해시로 바꾼다. `setup.sh --xdp-mode`·멀티큐(3.3, 3.3a, 4.4a, 5.2), systemd 서비스(3.6), `apply`/`export`, Grafana 대시보드(3.7.3)가 모두 들어 있다.
+- 로컬 근거(2026-10-21 최종 회귀, 제품 코드 `61ab576`. 실행 중 이 런북만 수정 중이라 일부 `commit.txt`가 `61ab576-dirty`). VirtualBox VM은 한 번에 하나만 켰고(L3는 구조상 2대), 처리량은 VM 타이머 점검(timer-health)이 OK일 때만 판정했다. 물리 서버에는 이 점검이 해당하지 않는다.
+  - L1 Docker: `l1-20261021_073924` 26 PASS / 0 FAIL / 8 SKIP(sch_fq 없음 → L2).
+  - L2 Ubuntu 22.04(5.15.0-198): timer OK에서 기본 `l2-jammy-20261021_075811` 36 PASS·SKIP 2, TX 큐 2(최대 8) `…_080048` 38 PASS, native + TX 큐 4 `…_080336` 37 PASS, 비root setup + TX 큐 2 `…_080548` 37 PASS. 4세션 counter 판정 전부 ±0.2% 이내, iperf goodput -0.8~-8.3%(UL은 헤더·ACK 몫).
+  - L2 Ubuntu 24.04(6.8.0-147): 같은 4개 조합에서 기능 단계 FAIL 0. 처리량은 이번 실행 내내 VM 타이머 열화(p99 61~134 ms, 재기동 후에도)라 판정하지 않았다. 같은 VM의 커널 셰이퍼도 같은 폭으로 미달했다(`fq maxrate 20mbit` → 7.95 Mbps). cap 초과는 0건. 24.04 처리량의 근거는 이전 건강한 실행(`l2-noble-20261020_083018`, counter ±0.3%, B-UL만 -8.7%)이다 — 4.2의 B-UL 주의(X27).
+  - systemd 서비스(`testbed/l2-systemd.sh`, 설치 → 재부팅 → 확인 → 제거): 22.04 `l2sd-jammy-20261021_080804`, 24.04 `l2sd-noble-20261021_082825` 모두 pre 3/3, post 38/38, cleanup 4/4 PASS(monitor `After=`만, monitor 재시작이 main을 끌어오지 않음, MONITOR_ARGS 재시작 대상, 하드닝 상태의 모듈 자동 로드 포함).
+- L3 로컬 테스트베드(`testbed/l3-vbox.sh`: Open5GS 2.8 레퍼런스 설치 + UERANSIM v3.2.7 VM과 서비스 노드 Ubuntu 24.04 VM을 별도 N6로 연결)에서 문서 명령 그대로 확인한 범위: 1.4(방법 A·B, conntrack 삭제), 1.5(FORWARD 정책이 `ACCEPT`인 경우), 1.6(`ip route add`/`get`), 1.7(종단 확인, 귀환 경로가 없을 때의 진단), 4.0(`uesimtunN`), 4.1, 5.2. 최종 회귀 `l3-20261021_095653`(testbed 보강 후: RAN 생존 확인, 측정값 없는 단계는 INVALID)에서 위 범위와 4.2 counter 판정(4세션 모두 ±10%: +0.1 / -0.0 / -9.4 / -4.5%), 4.5 killswitch(UE-B TX_DROPS 0 → 12, UE-A 정상)가 PASS였다. iperf goodput은 A-DL만 -12.5%였는데, 같은 NIC의 커널 `fq maxrate`도 6 Mbit 중 3.0 Mbit에 그쳐 환경(UERANSIM 경로, VM 타이머 열화)으로 분류했다. 같은 날 앞선 실행(`l3-20261021_083236`·`_090118`·`_091722`)은 서비스 VM 잔여 설치물과 UERANSIM 무선 구간 끊김 때문에 무효다. **확인하지 않은 것**: 1.5의 `-P FORWARD DROP` 분기, 1.5a 영구화(ufw·iptables-persistent), 1.6의 netplan 영구화, 3.7(대시보드 UI, 원격 scrape), 4.4/4.4a(물리 멀티큐), 4.5 D4 — 6장과 함께 L4에서 확인한다.
+- 설치 경로는 두 가지다(README §5, §5a). **(가) 수동**: 3.2 `load` → 3.3 `setup.sh` → 4.1 `set`. 단계마다 출력이 바로 보여 첫 설치·측정·진단에 맞다. 재부팅하면 핀·attach·정책이 모두 사라진다. **(나) systemd 서비스**: 3.6 `install.sh` → `/etc/vantage-5g/` 설정 → `systemctl start`. 부팅마다 load → `apply --replace`(policies.conf) → `setup.sh` 순으로 자동 실행된다. 권장 순서: (가)로 3~5장을 끝까지 한 번 측정한 뒤 3.6으로 (나)를 설치하고, 3.6.5 재부팅 확인 후 필요하면 4장을 서비스 상태에서 다시 측정한다. (나)의 로컬 근거는 위 systemd 서비스 줄이다(테스트 N6는 systemd-networkd veth).
 - 형식: 각 단계는 **명령 / 기대 결과 / 실패 시** 순서다.
 - 기호(예시 값은 README §3.2와 같다. 실제 값으로 바꾼다):
 
@@ -40,15 +43,16 @@ mkdir -p ~/vt-l4
   ```bash
   sudo apt-get update
   sudo apt-get install -y build-essential clang llvm libbpf-dev libelf-dev zlib1g-dev pkg-config \
-      linux-tools-common "linux-tools-$(uname -r)" iproute2 iperf3 tcpdump ethtool
+      linux-tools-common "linux-tools-$(uname -r)" iproute2 iperf3 tcpdump ethtool curl git python3
   bpftool version
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # 이후 새 셸 또는 . ~/.cargo/env
+  rustc --version
   ```
-- 기대: apt rc=0. `bpftool version`이 버전을 출력한다("WARNING: bpftool not found for kernel …"이 아님).
-- 실패 시: `linux-tools-$(uname -r)` 후보가 없으면(HWE·커스텀 커널) `apt-cache search linux-tools | grep $(uname -r)`로 flavour 패키지를 찾는다. `bpftool` 패키지를 따로 설치하려 하지 않는다(22.04/24.04 모두 설치 후보 없음, 로컬 확인).
+- 기대: apt rc=0. `bpftool version`이 버전을 출력한다("WARNING: bpftool not found for kernel …"이 아님). `rustc` 1.89 이상(`Cargo.toml`의 `rust-version = "1.89"`; 잠금에 쓰는 `File::try_lock`). `curl`(rustup), `git`(1.3), `python3`(4.2 판정 스크립트)는 최소 설치 서버에 없을 수 있어 함께 설치한다.
+- 실패 시: `rustc`가 1.89 미만이면 `rustup update stable`(apt의 `rustc`를 쓰지 않는다. 빌드는 `rust-version` 오류로 멈춘다). `linux-tools-$(uname -r)` 후보가 없으면(HWE·커스텀 커널) `apt-cache search linux-tools | grep $(uname -r)`로 flavour 패키지를 찾는다. `bpftool` 패키지를 따로 설치하려 하지 않는다(22.04/24.04 모두 설치 후보 없음, 로컬 확인).
 
 ### 1.3 소스
-- 명령: `git clone https://github.com/uni2u/vantage-5g.git && cd vantage-5g && git checkout <COMMIT> && git log -1 --oneline && ls -l setup.sh detach.sh`
+- 명령: `git clone https://github.com/uni2u/vantage-5G.git && cd vantage-5G && git checkout <COMMIT> && git log -1 --oneline && ls -l setup.sh detach.sh`
 - 기대: 해시가 일치하고 두 스크립트가 `-rwxr-xr-x`이다(X1/D18).
 - 실패 시: 실행 권한이 없으면 중단하고 보고한다(`bash setup.sh`로 우회하지 않는다).
 
@@ -170,11 +174,21 @@ DL 응답이 Vantage가 붙은 `<IF>`로 나가야 TX 페이서와 killswitch가
   ```bash
   sudo vantage-5G export > /tmp/policies.conf && diff /tmp/policies.conf /etc/vantage-5g/policies.conf   # CLI로만 바꾼 정책 확인
   git fetch && git checkout <COMMIT> && make build
-  sudo ./install.sh install 2>&1 | tail -4; echo rc=${PIPESTATUS[0]}
-  sudo systemctl restart vantage-5g; systemctl is-active vantage-5g vantage-5g-monitor
+  sudo ./install.sh install 2>&1 | tail -8 | tee ~/vt-l4/2.4-install.txt; echo rc=${PIPESTATUS[0]}
+  systemctl show -p MainPID --value vantage-5g-monitor
+  sudo systemctl restart vantage-5g
+  sudo systemctl restart vantage-5g-monitor
+  systemctl is-active vantage-5g vantage-5g-monitor; systemctl show -p MainPID --value vantage-5g-monitor
   journalctl -u vantage-5g -n 20 --no-pager | tee ~/vt-l4/2.4-restart.txt
   ```
-- 기대: diff가 주석 줄만 다르면 파일이 최신이다(다르면 `sudo mv /tmp/policies.conf /etc/vantage-5g/policies.conf`로 저장할지 결정). install rc=0, 출력에 `vantage-5g.service is running the previous version; to switch …` 안내. restart는 detach → unload → load → apply → setup이므로 맵 정의가 바뀐 업그레이드(2.2의 거부)도 이것으로 끝난다. `active` 두 줄, journal에 새 load와 `applied … (--replace)`.
+- 기대: diff가 주석 줄만 다르면 파일이 최신이다(다르면 `sudo mv /tmp/policies.conf /etc/vantage-5g/policies.conf`로 저장할지 결정). install rc=0이고 출력 끝에 다음 안내가 나온다:
+  ```
+  The running units still use the previous version; to switch:
+    sudo systemctl restart vantage-5g.service    (re-attach, short shaping gap)
+    sudo systemctl restart vantage-5g-monitor.service
+  (each unit is restarted on its own; restarting one does not restart the other)
+  ```
+  두 유닛은 따로 재시작한다. `restart vantage-5g`만 하면 monitor는 옛 바이너리로 계속 돈다. vantage-5g의 restart는 detach → unload → load → apply → setup이므로 맵 정의가 바뀐 업그레이드(2.2의 거부)도 이것으로 끝난다. `active` 두 줄, monitor MainPID가 restart 전과 다르다. journal에 새 load와 `applied … (--replace)`가 있다.
 - 실패 시: restart 후 `failed`이면 3.6.3의 실패 시 표로 단계를 판정한다. stop 단계 실패는 3.6.6의 실패 시를 따른다.
 
 ## 3. 빌드 → load → attach
@@ -253,7 +267,10 @@ DL 응답이 Vantage가 붙은 `<IF>`로 나가야 TX 페이서와 killswitch가
   grep -vE '^\s*(#|$)' /etc/vantage-5g/vantage-5g.env /etc/vantage-5g/policies.conf | tee ~/vt-l4/3.6.2-config.txt
   ```
   아무것도 load되지 않은 상태라면 `export`는 `open pinned ue_policy_map …`로 실패하고 `mv`는 실행되지 않는다(예시에서 만든 policies.conf 유지). 그때는 policies.conf를 직접 쓴다(형식: 파일 안 주석, README §6.1).
-- 기대: export 첫 두 줄이 `# Vantage-5G policies (vantage-5G export): …` 주석이고 이어서 UE별 `<ip> <rx> <tx>` 줄이 주소 순으로 나온다(4.1의 정책과 같음). env에 `IFACE=<IF>`가 있다. `XDP_MODE=`는 비우지 않는다(비우면 preflight status=1, 줄을 지우면 generic). `IFACE_WAIT_SEC`는 최대 240(초과 값은 240으로 줄고 경고). 예시의 `MONITOR_ARGS=--bind 127.0.0.1`을 유지한다. `/metrics`에는 모든 UE의 IP·정책·카운터가 나오므로 원격 Prometheus가 필요하면 관리망 주소로만 `--bind`하고 방화벽으로 제한한다(`--bind`가 없으면 N6 쪽을 포함한 `0.0.0.0:9090`).
+- 기대: export 첫 두 줄이 `# Vantage-5G policies (vantage-5G export): …` 주석이고 이어서 UE별 `<ip> <rx> <tx>` 줄이 주소 순으로 나온다(4.1의 정책과 같음). env에 `IFACE=<IF>`가 있다. `XDP_MODE=`는 비우지 않는다(비우면 preflight status=1, 줄을 지우면 generic). `IFACE_WAIT_SEC`는 최대 240(초과 값은 240으로 줄고 경고). 예시의 `MONITOR_ARGS=--bind 127.0.0.1`을 유지한다. `/metrics`에는 모든 UE의 IP·정책·카운터가 나오므로 원격 Prometheus가 필요하면 관리망 주소로만 `--bind`하고 방화벽으로 제한한다(`--bind`가 없으면 N6 쪽을 포함한 `0.0.0.0:9090`. 원격 scrape는 3.7.2). `--port`는 1024 이상을 쓴다(monitor 유닛의 capability에 `CAP_NET_BIND_SERVICE`가 없어 1024 미만이면 bind 권한 오류로 재시작을 반복하다가 failed가 된다).
+- 서비스를 시작한 **뒤에** env를 바꾸면 키별로 재시작할 유닛이 다르다. 두 유닛은 서로를 재시작하지 않는다:
+  - `IFACE`, `XDP_MODE`, `IFACE_WAIT_SEC` → `sudo systemctl restart vantage-5g`(재attach)
+  - `MONITOR_ARGS` → `sudo systemctl restart vantage-5g-monitor`(`restart vantage-5g`로는 bind 주소가 바뀌지 않는다. 로컬 L2 jammy에서 재현)
 - 실패 시: export가 stderr로 `[!] <ip>: … is not a whole Mbps; exported rounded down`을 내면 그 UE의 값을 기록한다(set/apply 외의 도구가 맵에 쓴 것).
 
 #### 3.6.3 start
@@ -265,7 +282,7 @@ DL 응답이 Vantage가 붙은 `<IF>`로 나가야 TX 페이서와 killswitch가
   sudo vantage-5G list; ip -d link show dev <IF> | grep -o 'prog/xdp[a-z]* id [0-9]*'; tc qdisc show dev <IF>
   ss -ltnp | grep 9090; curl -s http://127.0.0.1:9090/metrics | grep -c '^vantage_'
   ```
-- 기대: rc=0, `Active: active (exited)`. journal 순서: `[i] BPF objects from /usr/local/lib/vantage-5g` → `[+] applied /etc/vantage-5g/policies.conf (--replace): added …` → `[+] Vantage-5G attached to <IF>.` → `Finished`. `list`가 policies.conf와 같고, XDP·qdisc는 3.3과 같다. 9090 LISTEN(MONITOR_ARGS의 주소), 메트릭 줄 수 > 0.
+- 기대: rc=0, `Active: active (exited)`. journal 순서: `[i] BPF objects from /usr/local/lib/vantage-5g` → `[+] applied /etc/vantage-5g/policies.conf (--replace): added …` → `[+] Vantage-5G attached to <IF>.` → `Finished`. `list`가 policies.conf와 같고, XDP·qdisc는 3.3과 같다. `ss`의 9090 LISTEN이 MONITOR_ARGS의 주소 **하나뿐**이다(예시 그대로면 `127.0.0.1:9090`만 있고 `0.0.0.0:9090`이나 `*:9090`은 없다). 메트릭 줄 수 > 0.
 - 실패 시: 서비스는 실패해도 **자동 정리하지 않는다**. `systemctl status`의 `ExecStartPre=…`/`ExecStart=… (code=exited, status=N)` 줄로 단계를 판정한다:
   - `vantage-5g-unit.sh preflight` status=1: env 오류(`IFACE is not set`, `not a valid interface name`, `XDP_MODE is empty`, `XDP_MODE … must be generic or native`) 또는 `policies.conf not found`. status=6: `interface <IF> did not appear within 90s`. `ip link`로 이름을 확인한다.
   - `vantage-5G load` status=1: 3.2의 실패 시와 같다(`pinned maps … do not match`이면 2장).
@@ -314,8 +331,45 @@ DL 응답이 Vantage가 붙은 `<IF>`로 나가야 TX 페이서와 killswitch가
   sudo systemctl restart vantage-5g; systemctl is-active vantage-5g vantage-5g-monitor
   systemctl show -p MainPID --value vantage-5g-monitor; sleep 2; curl -s http://127.0.0.1:9090/metrics | grep -c '^vantage_ue_policy_'
   ```
-- 기대: stop rc=0. `is-failed`가 `inactive`(failed 아님), monitor는 `active`로 남는다(Wants=, 핀이 없는 동안 journal에 scrape 오류 1회, `/metrics`의 UE 시리즈 없음). `/sys/fs/bpf/vantage` 없음(`No such file or directory`), `prog/xdp` 0줄, root qdisc는 5.2와 같은 커널 기본값. start 후 두 유닛 모두 `active`(monitor는 처음부터 계속 실행 중). restart 후 둘 다 `active`이고 monitor PID는 **그대로**이며 `/metrics`에 UE 시리즈가 다시 나온다(새 맵을 다시 읽음). restart = detach → unload → load → apply → setup(짧은 셰이핑 공백). monitor까지 멈추려면 `sudo systemctl stop vantage-5g-monitor vantage-5g`.
+- 선택 확인(monitor가 main을 끌어오지 않음, Q8-11): `sudo systemctl stop vantage-5g; sudo systemctl restart vantage-5g-monitor; systemctl is-active vantage-5g vantage-5g-monitor; ls /sys/fs/bpf/vantage 2>&1 | head -1; sudo systemctl start vantage-5g` → `inactive`, `active`, `No such file or directory`(점검 중 monitor를 재시작해도 load·attach가 일어나지 않는다). 마지막 start로 원래 상태로 돌린다.
+- 기대: stop rc=0. `is-failed`가 `inactive`(failed 아님), monitor는 `active`로 남는다(monitor 유닛은 `After=vantage-5g.service`만 두고 의존 관계가 없다. 핀이 없는 동안 journal에 scrape 오류 1회, `/metrics`의 UE 시리즈 없음). `/sys/fs/bpf/vantage` 없음(`No such file or directory`), `prog/xdp` 0줄, root qdisc는 5.2와 같은 커널 기본값. start 후 두 유닛 모두 `active`(monitor는 처음부터 계속 실행 중). restart 후 둘 다 `active`이고 monitor PID는 **그대로**이며 `/metrics`에 UE 시리즈가 다시 나온다(새 맵을 다시 읽음). restart = detach → unload → load → apply → setup(짧은 셰이핑 공백). monitor까지 멈추려면 `sudo systemctl stop vantage-5g-monitor vantage-5g`.
 - 실패 시: **stop은 정리에 실패해도 rc=0을 돌려준다.** `is-failed`가 `failed`이면 `journalctl -u vantage-5g -n 20`에서 `Vantage programs are still attached:` 아래 목록을 확인하고, 각 인터페이스에 `sudo /usr/local/lib/vantage-5g/detach.sh <iface>` → `sudo vantage-5G unload` → `sudo systemctl reset-failed vantage-5g`. 그 전까지 핀은 유지되고 CLI로 정책을 계속 바꿀 수 있다.
+
+### 3.7 Prometheus exporter 노출과 Grafana 대시보드 (VERIFY-L4)
+`/metrics`에는 모든 UE의 IP·정책·카운터가 나온다. 3.7.1은 서비스(3.6)를 설치했다면 반드시 하고, 3.7.2와 3.7.3은 원격 Prometheus나 Grafana를 쓸 때만 한다. 기호: `<MGMT_IP>`는 서비스 노드의 관리망 주소, `<PROM_IP>`는 Prometheus 호스트 주소다. 둘 다 N6 쪽이 아니어야 한다.
+
+#### 3.7.1 N6·UE 쪽에서 9090이 보이지 않는가
+- 명령:
+  ```bash
+  ss -ltnp | grep 9090 | tee ~/vt-l4/3.7.1-ss.txt
+  # [UPF 호스트] (N6 쪽에서)
+  curl -m3 -s -o /dev/null -w '%{http_code}\n' http://<SVC>:9090/metrics; echo rc=$?
+  # [UE 호스트] (5G 경로로)
+  curl -m3 --interface uesimtun0 -s -o /dev/null http://<SVC>:9090/metrics; echo rc=$?
+  ```
+- 기대: `ss`에는 `127.0.0.1:9090`(또는 3.7.2의 `<MGMT_IP>:9090`) 한 줄만 있다. UPF 호스트와 UE 쪽 curl은 둘 다 연결에 실패한다(`000`, rc=7 또는 28).
+- 실패 시: 200이 나오면 `MONITOR_ARGS`에 `--bind`가 없거나 N6 주소로 bind된 것이다. env를 고친 뒤 `sudo systemctl restart vantage-5g-monitor`를 실행하고(3.6.2) 다시 확인한다. 수동으로 `vantage-5G monitor`를 띄운 경우에는 기본값이 `0.0.0.0`이므로 `--bind`를 붙여 다시 띄운다.
+
+#### 3.7.2 원격 scrape: 관리망 bind + 방화벽 (선택)
+- 명령:
+  ```bash
+  sudoedit /etc/vantage-5g/vantage-5g.env         # MONITOR_ARGS=--bind <MGMT_IP> --port 9090
+  sudo systemctl restart vantage-5g-monitor
+  ss -ltnp | grep 9090 | tee ~/vt-l4/3.7.2-ss.txt
+  sudo ufw status | head -1
+  ```
+  방화벽으로 `<PROM_IP>`만 허용한다.
+  - **ufw가 이미 active이면:** `sudo ufw allow from <PROM_IP> to <MGMT_IP> port 9090 proto tcp`
+  - **ufw가 inactive이면:** 이 목적만으로 `ufw enable`을 하지 않는다. 기본 정책(default deny incoming)이 SSH와 4장의 iperf3 5201~5204를 막는다. 꼭 켜야 하면 `sudo ufw allow OpenSSH; sudo ufw allow 5201:5204/tcp`와 위 규칙을 **먼저** 넣고 켠다. 아니면 9090만 막는다: `sudo iptables -A INPUT -p tcp --dport 9090 ! -s <PROM_IP> -j DROP`(영구화는 1.5a (B)와 같은 방법).
+  - 확인: [Prometheus 호스트] `curl -m3 -s http://<MGMT_IP>:9090/metrics | grep -c '^vantage_'`, [UPF 호스트] `curl -m3 http://<MGMT_IP>:9090/metrics; echo rc=$?`
+- 기대: `ss`에 `<MGMT_IP>:9090` 한 줄만 있다. Prometheus 호스트에서는 줄 수가 0보다 크고, UPF 호스트에서는 실패한다. 3.7.1을 다시 실행해도 같은 결과다.
+- 실패 시: `ss`가 바뀌지 않았으면 `restart vantage-5g`를 실행한 것이다. `vantage-5g-monitor`를 재시작한다. monitor가 `failed`이면 `journalctl -u vantage-5g-monitor -n 20`에서 bind 오류(주소가 이 호스트에 없음, 포트 사용 중)를 확인한다.
+
+#### 3.7.3 Grafana 대시보드 (선택, `dashboards/README.md`)
+대시보드는 로컬에서 Grafana 11.2.0 / Prometheus 2.54.1로 provisioning과 모든 패널 쿼리가 오류 없이 도는 것까지 확인했다. 정책 표 transformation은 브라우저 밖에서 `@grafana/data` 11.2.0으로만 실행했다. **Grafana UI 렌더링은 확인하지 않았고, 이 절에서 확인한다.** `schemaVersion` 39라 Grafana 10.4 이상이면 로드될 것으로 예상하지만 검증하지 않았다.
+- 명령: 관리망 호스트의 Prometheus에 `job_name: vantage-5g`, `targets: ["<MGMT_IP>:9090"]`를 넣는다(서비스 노드 자체에서 돌리면 `127.0.0.1:9090`). 4장 측정 중에는 `scrape_interval: 1s`로 둔다. Grafana에서 Dashboards → Import → `dashboards/vantage-5g.json`을 올리고 *Prometheus* 드롭다운에서 데이터 소스를 고른다. Grafana·Prometheus 버전을 기록한다.
+- 기대: Prometheus Targets에서 `vantage-5g` 타깃이 UP이다. 대시보드의 *Exporter* 변수에 서비스 노드가, *UE* 변수에 policies.conf(또는 4.1)의 UE가 나온다. *UEs with a policy*가 정책 수와 같고, *Exporter scrape*가 1이다. 정책 표는 UE마다 한 행이고 exporter 열이 있다.
+- 실패 시: *Exporter scrape*가 No data이면 `job_name`이 `vantage-5g`가 아닌 것이다(패널 쿼리가 `up{job="vantage-5g"}`). 처리량 패널이 비어 있으면 rate window를 scrape 간격의 3배 이상으로 고른다(`dashboards/README.md` §1). 화면 이상(표 열 순서, `KILLSWITCH`/`uncapped` 표시, ±10% 선)은 스크린샷과 함께 보고한다.
 
 ## 4. README §8 측정 (4세션 동시)
 
@@ -374,11 +428,27 @@ DL 응답이 Vantage가 붙은 `<IF>`로 나가야 TX 페이서와 killswitch가
   ```
 - 판정(저장소 디렉토리에서, 서비스 노드 또는 결과를 가져온 PC): `python3 .claude/skills/vantage-testbed/scripts/iperf_verdict.py ~/vt-l4/spec.csv`와 `python3 .claude/skills/vantage-testbed/scripts/counter_verdict.py ~/vt-l4/spec.csv ~/vt-l4/stats_t1.txt ~/vt-l4/stats_t2.txt` (출력 해석: README §8.5)
 - 기대: counter 판정 4세션 모두 ±10%(로컬 jammy 기준 ±0.3%). iperf goodput ±10%(UL은 헤더와 ACK 때문에 -1~-7%가 정상).
+- Ubuntu 24.04 서버라면 B-UL(3 Mbps) 행을 따로 기록한다. 로컬 24.04 VM에서는 이 행만 counter -9~-12%로 미달한 적이 있다(X10b, 미분류. 22.04는 ±0.4%). 미달이면 B-UL 단독(`iperf3 -c <SVC> -B <UE_B> -p 5202 -t 30 -J > b_ul_solo.json`, 같은 방식의 stats 스냅샷)을 한 번 더 측정해 4세션 결과와 비교한다.
 - 실패 시: cap **초과**면 즉시 보고한다(`tc qdisc show dev <IF>`, `stats` 증가 여부, 1.4/1.7 NAT, 4.0 바인딩, `ip route get <UE_A>`가 `dev <IF>`인지). 미달이면 4.3과 서버 CPU(`mpstat -P ALL 1`)를 함께 기록한다.
 
 ### 4.3 측정 직후 상태
 - 명령: `sudo ./target/release/vantage-5G stats; tc -s qdisc show dev <IF>; ethtool -S <IF> | grep -iE 'drop|miss' | head`
 - 기대: 정상 TCP에서는 tx_drops가 0 근처다. fq `dropped`는 작다.
+
+### 4.3a 미달 분류용 커널 셰이퍼 대조 (선택, 4.2에서 DL이 cap보다 10% 넘게 낮을 때)
+경로 자체가 cap을 못 내는 것인지, 페이서 문제인지를 가른다. 같은 NIC에서 커널 `fq maxrate`(플로우당 상한)로 같은 속도를 걸어 단일 DL 플로우를 잰다. 로컬 VM에서 쓰던 timer-health 점검은 VM 전용이라 물리 서버에서는 하지 않는다. 대조 중에는 `<UE_A>`가 셰이핑되지 않으니 트래픽이 없는 시간에 한다.
+- 명령:
+  ```bash
+  sudo ./target/release/vantage-5G reset --ue-ip <UE_A>
+  sudo tc qdisc del dev <IF> root; sudo tc qdisc add dev <IF> root fq maxrate 20mbit
+  # [UE 호스트] iperf3 -c <SVC> -B <UE_A> -p 5203 -t 30 -R -J > ~/vt-l4/a_dl_kfq.json
+  # 복구 — replace root fq로는 maxrate가 남으므로 반드시 del 후 setup.sh
+  sudo tc qdisc del dev <IF> root; sudo ./setup.sh <IF>; echo rc=$?     # 서비스로 운영 중이면: sudo systemctl restart vantage-5g
+  sudo ./target/release/vantage-5G set --ue-ip <UE_A> --rx-mbps 10 --tx-mbps 20
+  tc qdisc show dev <IF>
+  ```
+- 기대: 커널 fq도 4.2의 A-DL과 같은 폭으로 미달하면 경로·환경 문제로 기록한다(서버 CPU, NIC 오프로드, 무선 구간). 커널 fq는 20에 맞는데 Vantage만 미달하면 datapath로 보고한다. 복구 뒤 `setup.sh` rc=0이고 qdisc가 3.3과 같다.
+- 실패 시: 복구 후 `tc qdisc show`에 `maxrate`가 남아 있으면 del과 `setup.sh`를 다시 실행한다.
 
 ### 4.4 멀티큐 UL 경합 (X14)
 - 명령: [UE 호스트] `iperf3 -c <SVC> -B <UE_A> -p 5201 -t 30 -P 8 -J > a_ul_p8.json`, 동시에 4.2처럼 stats 스냅샷을 남긴다.
@@ -394,7 +464,18 @@ DL 응답이 Vantage가 붙은 `<IF>`로 나가야 TX 페이서와 killswitch가
 - killswitch: `sudo ./target/release/vantage-5G set --ue-ip <UE_B> --rx-mbps 3 --tx-mbps 0`(출력 끝 `(killswitch: DL blocked)`) 후 [UE 호스트]에서 `ping -I <UE_B의 uesimtunN> -c3 <SVC>`가 실패하고, `ping -I <UE_A의 uesimtunN> -c3 <SVC>`는 정상이어야 한다. `stats`에서 `<UE_B>`의 TX_DROPS가 증가한다. 이어서 `set … --tx-mbps 5`로 복구한다.
 - D4: UE-A를 tx 1 Mbps로 두고 서비스 노드 뒤(포워딩되는 쪽) 호스트에서 UE-A로 UDP 100M을 10 s 보낸다. 직후 TCP DL이 연결되고 1 Mbps 근처가 나와야 한다. tx_drops 증가는 정상이다. 끝나면 정책을 원래대로 돌린다.
 
+### 4.6 측정 중 대시보드 판독 (선택, 3.7.3을 했을 때 — VERIFY-L4)
+- 명령: 4.2 실행 중, 4.5 killswitch 중, `reset` 직후, 5.2 unload 직후에 Grafana 화면을 캡처한다(`~/vt-l4/4.6-*.png`). rate window는 15s(scrape 1s면 5s도 된다).
+- 기대:
+  - 4.2: *DL/UL throughput vs cap*에서 UE별 선이 cap 점선 근처에 있다. *realized / cap (%)*는 90~110% 선 안에 있고, 그 값이 `counter_verdict.py`의 err%와 몇 % 안에서 맞는다(둘 다 L2 바이트 기준). 정책 표의 행 수는 UE 수와 같다.
+  - 4.5 killswitch: 정책 표의 TX cap이 `KILLSWITCH`, *Killswitch UEs* = 1, *DL drops/s*가 증가한다. 복구 후에는 0으로 돌아간다.
+  - `sudo ./target/release/vantage-5G reset --ue-ip <UE_B>` 후: *UEs with counters but no policy* = 1이고, `<UE_B>`가 정책 표에서 빠진다. 확인했으면 다시 `set`한다.
+  - 5.2 unload 후: vantage 시리즈가 모두 사라지고 *Exporter scrape*는 1이다.
+- 실패 시: 비율이 counter 판정과 크게 다르면 rate window와 scrape 간격을 기록한다. 화면 이상(표 열·값 매핑·임계선)은 스크린샷과 함께 보고한다.
+
 ## 5. detach → unload → 잔존물
+
+(나) 서비스(3.6)로 운영 중이면 5.2의 수동 detach/unload 대신 `sudo systemctl stop vantage-5g`(3.6.6)를 쓰고, 5.2와 같은 잔존물 확인을 한다. 서버에서 빼려면 5.3을 쓴다. 서비스가 active인 상태에서 수동으로 unload하면 유닛은 `active (exited)`로 남고, 이후 `reload`는 맵이 없어 실패한다. 5.1의 unload 가드 확인은 서비스 상태에서도 그대로 할 수 있다.
 
 ### 5.1 unload 가드
 - 명령: `sudo ./target/release/vantage-5G unload; echo rc=$?`
@@ -436,6 +517,10 @@ DL 응답이 Vantage가 붙은 `<IF>`로 나가야 TX 페이서와 killswitch가
 | X22 | systemd 서비스: 실제 NIC(드라이버 로드 시간, bond/VLAN, netplan)에서 부팅 시 `network-online.target` 이후 `IFACE`가 제때 있는지(preflight 대기 시간), 재부팅 후 attach·정책 복원. 로컬은 systemd-networkd veth로만 확인 | 3.6.5 |
 | X23 | systemd 서비스와 native XDP(`XDP_MODE=native`)의 부팅·restart 시 링크 리셋 | 3.6.5, 3.6.6 |
 | V20 | 맵 메모리(LRU 3개 memlock 합계 ≈ 4.5 MiB, 커널별 표시 차이) | 3.2 |
+| X24 | Grafana UI 렌더링: 정책 표(merge/organize, exporter 열), 값 매핑(`KILLSWITCH`/`uncapped`), ±10% 선, rate window `$__rate_interval` 선택. 로컬은 쿼리와 transformation 로직만 확인했다 | 3.7.3, 4.6 |
+| X25 | exporter 노출: N6·UE 쪽에서 9090 불가, 관리망 bind + 방화벽으로 원격 scrape | 3.7.1, 3.7.2 |
+| X26 | 실제 다중 노드: Vantage 노드 2대 이상(또는 UPF 2대가 같은 UE 풀 10.45.0.0/16을 쓰는 경우)을 한 Prometheus로 수집 — 정책 표가 exporter 열로 구분되는지, *Exporter scrape*가 `min(up{job="vantage-5g"})`. 로컬은 가짜 exporter 2개로만 확인 | 3.7.3 (해당 시) |
+| X27 | 24.04의 B-UL(3 Mbps, 4세션) 미달(X10b, 로컬 VM에서 미분류) | 4.2 |
 
 ## 7. 가져올 것
-`~/vt-l4/` 전체(서비스 노드와 UE 호스트 양쪽, UPF 호스트의 1.4 출력 포함. 단계별 출력, `nproc`, 3.2의 `bpftool map show` 출력), `*.json` 4~5개, `spec.csv`, 3.6을 했다면 `3.6.*`·`2.4`·`5.3` 출력과 `journalctl -b -u vantage-5g --no-pager` 전체, `stats_t1.txt`, `stats_t2.txt`, `ethtool -i`/`-l` 출력, 커밋 해시, `uname -r`.
+`~/vt-l4/` 전체(서비스 노드와 UE 호스트 양쪽, UPF 호스트의 1.4 출력 포함. 단계별 출력, `nproc`, 3.2의 `bpftool map show` 출력), `*.json` 4~5개, `spec.csv`, 3.6을 했다면 `3.6.*`·`2.4`·`5.3` 출력과 `journalctl -b -u vantage-5g --no-pager` 전체, `stats_t1.txt`, `stats_t2.txt`, `ethtool -i`/`-l` 출력, 커밋 해시, `uname -r`. 3.7을 했다면 `3.7.*` 출력, Prometheus Targets 화면, Grafana 스크린샷(`4.6-*.png`: 4.2 측정 중, killswitch, reset, unload), Grafana·Prometheus 버전. 4.3a를 했다면 `a_dl_kfq.json`, 24.04에서 B-UL 단독을 쟀다면 `b_ul_solo.json`과 그때의 stats 스냅샷.

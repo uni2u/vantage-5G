@@ -312,6 +312,9 @@ cleanup)
     rm -f /etc/systemd/network/50-vn6.netdev /etc/systemd/network/50-vn6.network /etc/systemd/network/50-vn6p.network
     ip link del vn6 2>/dev/null; networkctl reload
     ip -br link | grep -E 'vn6|vx0' && bad "test iface left" || ok "test iface removed"
+    # Flush the removals to disk: a hard power-off right after the test (VBoxManage controlvm
+    # ... poweroff) otherwise loses them and the next boot starts the uninstalled units again.
+    sync
     echo "RESULT-cleanup pass=$PASS fail=$FAIL"
     ;;
 *) echo "usage: $0 pre|post|cleanup"; exit 1 ;;

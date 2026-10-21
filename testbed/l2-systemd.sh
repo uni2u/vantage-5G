@@ -83,6 +83,7 @@ fi
 step cleanup
 
 echo; cat "${OUT}/summary.txt"; echo "L2 systemd results: ${OUT}"
+echo "[i] power the VM off with: VT_RELEASE=${REL} ./testbed/l2-vbox.sh stop (sync + ACPI), not VBoxManage controlvm poweroff"
 want=3; [[ "${MODE}" == cleanup ]] && want=1
 ok=$(grep -cE '^(pre|post|cleanup): RESULT-[a-z]+ pass=[0-9]+ fail=0$' "${OUT}/summary.txt")
 [[ "${ok}" -eq "${want}" ]] && ! grep -q '^reboot: FAIL' "${OUT}/summary.txt"

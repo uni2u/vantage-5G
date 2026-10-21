@@ -100,9 +100,12 @@ wait_ready() {
     vssh 'cloud-init status --wait >/dev/null; cloud-init status --long | head -3'
 }
 
-# vm_poweroff: ACPI shutdown, then hard power-off after 90 s.
+# vm_poweroff: guest sync, ACPI shutdown, then hard power-off after 90 s.
+# The sync matters for the fallback: a hard power-off loses writes still in the guest page
+# cache (seen: a finished `install.sh uninstall` came back after the next boot).
 vm_poweroff() {
     vm_running || return 0
+    vssh sync >/dev/null 2>&1     # SSH_OPTS has ConnectTimeout=5: an unreachable guest does not block
     VBoxManage controlvm "${VM}" acpipowerbutton >/dev/null 2>&1
     for _ in $(seq 1 45); do vm_running || return 0; sleep 2; done
     VBoxManage controlvm "${VM}" poweroff >/dev/null 2>&1; sleep 2
